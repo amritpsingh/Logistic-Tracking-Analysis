@@ -1,0 +1,170 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # ESS0 → ESS1 parsing
+# MAGIC
+# MAGIC Single notebook template used by all three Social Census forms.
+# MAGIC Per-form variation is confined to `CONFIG_FILE` and `PK_COLUMN`
+# MAGIC (see the constants cell below).
+# MAGIC
+# MAGIC Flow:
+# MAGIC 1. Resolve `collection_instance_id` for the logger context.
+# MAGIC 2. Confirm the target table exists.
+# MAGIC 3. Parse the batch — one call produces both the success
+# MAGIC    projection and the failure observations.
+# MAGIC 4. Log every failure into the exceptions table.
+# MAGIC 5. Verify the no-silent-loss invariant: every input PK is in the
+# MAGIC    success output OR the failure set.
+# MAGIC 6. Diff the target table schema against the parsing contract.
+# MAGIC    Log any column mismatch and abort the write.
+# MAGIC 7. Write the success DataFrame to the target table.
+# MAGIC
+# MAGIC Unhandled exceptions at any step are logged as `processing_error`
+# MAGIC records and re-raised so the job fails loudly.
+
+# COMMAND ----------
+
+import traceback
+
+from pyspark.sql import functions as F
+
+from definitions import spark
+from transformations.parsing import Parsing
+from transformations.schema_operations import (
+    build_schema,
+    find_schema_mismatches,
+    table_exists,
+)
+from transformations.settings import get_collection_widget
+from utils.logger import ExceptionLogger
+
+# COMMAND ----------
+
+# ── Per-form configuration ────────────────────────────────────────────
+# Individual form (default in this template):
+CONFIG_FILE = "individual/individual_parsing"
+PK_COLUMN = "responseId"
+
+# Dwelling form — uncomment to use:
+# CONFIG_FILE = "dwelling/dwelling_parsing"
+# PK_COLUMN = "responseId"
+
+# Household form — uncomment to use:
+# CONFIG_FILE = "household/household_parsing"
+# PK_COLUMN = "responseId"
+
+# Dwelling person form — uncomment to use:
+# CONFIG_FILE = "household/dwelling_person_parsing"
+# PK_COLUMN = "uoi"
+
+# COMMAND ----------
+
+# ── collection_instance_id for the logger context ─────────────────────
+# Sourced from get_collection_widget() pending team confirmation that
+# this widget carries the collection_instance_id value in production.
+# Switch to the direct-widget block below if confirmation says otherwise.
+collection_instance_id = get_collection_widget().value
+
+# Direct-widget alternative — uncomment if get_collection_widget does
+# not carry the collection_instance_id value in this environment:
+#
+# dbutils.widgets.text("collection_instance_id", "")
+# collection_instance_id = dbutils.widgets.get("collection_instance_id").strip()
+# if not collection_instance_id:
+#     raise ValueError("collection_instance_id widget must be set.")
+
+# COMMAND ----------
+
+# ── Set up the parsing flow ───────────────────────────────────────────
+flow = Parsing(spark, CONFIG_FILE)
+
+input_ds = flow._transform_config.input_datasets[0]
+output_ds = flow._transform_config.output_datasets[0]
+output_vars = output_ds.variables
+
+# COMMAND ----------
+
+# ── Run parse → log → verify → schema-check → write ───────────────────
+try:
+    if not table_exists(spark, output_ds.path):
+        raise RuntimeError(
+            f"Target table {output_ds.path} does not exist. "
+            f"Create it via the upstream DDL job before running parsing."
+        )
+
+    data = flow.read()
+
+    # One call produces both the success projection and the failure
+    # observations from a shared parsed intermediate.
+    success_df, failures_df = flow.transform(data, pk_column=PK_COLUMN)
+
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id=collection_instance_id,
+        source_table=input_ds.path,
+        target_table=output_ds.path,
+    ) as logger:
+
+        # Log every failure observation
+        flow.log_failures(logger, failures_df)
+
+        # No-silent-loss invariant — every input PK is either in the
+        # success output or the failure set. Read from failures_df
+        # directly rather than the exceptions table to avoid depending
+        # on the logger having flushed mid-context.
+        input_pks = data["responses"].select(F.col(PK_COLUMN).alias("rid")).distinct()
+        output_pk_name = flow.infer_output_pk(input_pk=PK_COLUMN)
+        output_pks = success_df.select(F.col(output_pk_name).alias("rid")).distinct()
+        failure_pks = failures_df.select(F.col("response_id").alias("rid")).distinct()
+
+        missing_count = (
+            input_pks
+            .join(output_pks.unionByName(failure_pks).distinct(), "rid", "left_anti")
+            .count()
+        )
+        if missing_count > 0:
+            raise RuntimeError(
+                f"Coverage invariant violated: {missing_count} input rows are "
+                f"neither in the success output nor in the failure set."
+            )
+
+        # Diff the target table schema against the parsing contract.
+        # Log each column-level mismatch and abort the write.
+        expected_schema = build_schema(
+            output_vars,
+            use_alias=True,
+            include_insert_time_utc=True,
+        )
+        actual_schema = spark.table(output_ds.path).schema
+        mismatches = find_schema_mismatches(actual=actual_schema, expected=expected_schema)
+
+        if mismatches:
+            for m in mismatches:
+                logger.log(
+                    rule="schema_mismatch",
+                    event_type="PARSING",
+                    variable_name=m["column"],
+                    expected=m["expected"],
+                    observed=m["actual"],
+                    message=f"Target table schema {m['kind']} for column '{m['column']}'.",
+                )
+            raise RuntimeError(
+                f"Schema mismatch in {output_ds.path}: "
+                f"{len(mismatches)} column(s) differ. See exceptions log."
+            )
+
+        flow.write(success_df)
+
+except Exception:
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id=collection_instance_id,
+        source_table=input_ds.path,
+        target_table=output_ds.path,
+    ) as logger:
+        logger.log(
+            rule="processing_error",
+            event_type="PARSING",
+            message="Unhandled exception during parsing.",
+            stack_trace=traceback.format_exc(),
+        )
+    raise
