@@ -1,0 +1,311 @@
+
+currently, my team has wiki pages where we contain documentation of our project. I may have shared with you a wiki page related to Exception logs and Event logs design guide. now, i want to add subpages for each exception logs and event logs as API documentation. I want to add details like what each logging module does, how it works, what parameters it can take, what is output of specific logging module and where the output is saved. how mention how to run logging in different enviornments. If I missed details that are helpful in understanding and using of logging module for new users, add those details as well.
+
+
+we will make the improvements later. As of now, I am creating documentation for the Logger module on Azure Devops in Wiki pages. I currently have these docs pages.
+
+
+Exception Logs
+
+# **Catalog/Schema/Table details**
+- **Catalog**:`socpophousdata1_dev`
+- **Schema**:`social_census_logs`
+- **Table**:`exceptions`
+
+# **Overview**
+## **Purpose**
+- Capture errors, failures, and data quality issues
+- Provide actionable insights for remediation and investigation
+- Support audit, monitoring, and alerting
+
+## **When to use**
+- Use when:
+  - A rule fails validation
+  - Data does not meet contract requirements
+  - A system or integration error occurs
+  - An issue requires attention or remediation
+
+## **Key Principles**
+- Always include `error_code` and `validation_level`
+- Error messages are clear but concise
+- Avoid free-text-only errors - use structured codes
+- Use `is_blocking` to indicate pipeline impact
+- Capture `stack_trace` only for technical failures
+
+## **What not to log**
+- Do not log exceptions for expected behaviour 
+- Do not overuse Critical severity 
+- Do not duplicate the same exception repeatedly
+
+## **Structure**
+| **Field**  | **Purpose**  |
+| --- | --- |
+| id  | Unique ID for the table, acts as a primary key.  |
+| run_id  | Foreign Key for the pipeline run.  |
+| task_key  | If a workflow has multiple tasks associated with a job, each task is allocated a task key. Can also be used to define steps in multiple step processes.  |
+| source_table  | The table that the data related to the event is sourced from  |
+| target_table  | The table the data related to the event will be output to or stored in.  |
+| validation_level  | The validation is at what level, expected values `FILE\RECORD\FIELD\VALUE`|
+| event_type  | The type of event that has occurred. For example; ‘coding’, ‘MI_fix’, ‘edit’, ‘imputation’.  |
+| error_code| Type of error generated|
+| severity| Severity of error generated|
+| message  | Descriptive message associated with the event.  |
+| response_id  | Unique ID for the row being observed. Will be ‘person_nbr’ for individuals and ‘dwell_nbr’ for dwellings.  |
+| collection_instance_id  | Collection Instance Id  |
+| case_id  | Unique ID for a case in salesforce  |
+|stack_trace(optional)| Optional Stack Trace for reference, might be useful for multiple step processing|
+| variable_name  | The name of the variable being processed in the event.  |
+| is_blocking| Is the error blocking further processing|
+| created_timestamp_utc  | Timestamp of the log entry being created.  |
+
+## **Exception Log Code Flow**
+![image.png](/.attachments/image-f1c4b6ff-d2ed-4b82-861b-3499599dbc3a.png)
+
+
+
+
+
+
+
+
+
+I have already added one subpage under exception log:
+
+Error Code Registry
+
+
+Overview
+--------
+
+The **Error Code Registry** is the authoritative definition of how Data Contract Technical Validation failures are:
+*   Classified (WHAT failed)
+*   Interpreted (HOW the system reacts)
+*   Logged consistently across pipelines
+
+It enforces a **clear separation of concerns**:
+*   **Validation Rules** → What failed (used by developers)
+*   **Error Codes** → How the system classifies and reacts (governance-controlled)
+
+* * *
+
+Error_Code.yml file
+------------------
+
+The registry is maintained as YAML in the repository:
+👉 [View error_codes.yml](https://dev.azure.com/statisticsnz/Census%20Processing%20System/_git/SPH_Survey_Data_Sourcing?path=/src/utils/logger/config/error_codes.yml&version=GBmain&_a=contents)
+
+
+* * *
+
+🧩 Validation Rules (WHAT failed)
+=================================
+
+Validation rules are **developer-facing identifiers** used in code. Each rule must map to exactly one error code.
+
+
+📁 FILE-Level Rules
+-------------------
+
+| Rule | Description | Error Code |
+| --- | --- | --- |
+| file_not_found | Expected input file was not received | FILE_NOT_FOUND |
+| schema_mismatch | Input schema does not match the data contract | SCHEMA_MISMATCH |
+| duplicate_file | File was ingested more than once | DUPLICATE_FILE |
+| processing_error | Unhandled exception occurred during parsing execution | PROCESSING_ERROR |
+
+
+🧾 RECORD-Level Rules
+---------------------
+
+| Rule | Description | Error Code |
+| --- | --- | --- |
+| missing_primary_key | Primary key is missing or null | MISSING_PRIMARY_KEY |
+| duplicate_record | Multiple records found for the same primary key | DUPLICATE_RECORD |
+| empty_record | Record contains no usable values | EMPTY_RECORD |
+| json_parse | Raw JSON could not be parsed into expected structure | PARSE_FAILED |
+| explode_parse | Array JSON could not be parsed for explode | PARSE_FAILED |
+
+
+🧱 FIELD-Level Rules
+--------------------
+
+| Rule | Description | Error Code |
+| --- | --- | --- |
+| null_not_allowed | Mandatory field contains null value | NULL_NOT_ALLOWED |
+| invalid_date_format | Date value cannot be parsed using expected format | INVALID_DATE_FORMAT |
+| invalid_type | Field value does not match expected data type | INVALID_TYPE |
+| cast | Value could not be cast to expected type | CAST_FAILED |
+
+
+🔢 VALUE-Level Rules
+--------------------
+
+| Rule | Description | Error Code |
+| --- | --- | --- |
+| value_out_of_range | Value lies outside permitted domain | VALUE_OUT_OF_RANGE |
+| invalid_enum | Value does not match allowed enumeration | INVALID_ENUM |
+| logic_conflict | Cross-field logical consistency rule failed | LOGIC_CONFLICT |
+
+* * *
+
+⚙️ Error Codes (HOW the system reacts)
+======================================
+
+Error codes define the **governance behaviour** of failures.
+
+
+📁 FILE-Level Error Codes
+-------------------------
+
+| Error Code | Level | Blocking | Severity | Description |
+| --- | --- | --- | --- | --- |
+| FILE_NOT_FOUND | FILE | ✅ Yes | ERROR | Required input file was not received |
+| SCHEMA_MISMATCH | FILE | ✅ Yes | ERROR | File schema does not conform |
+| DUPLICATE_FILE | FILE | ✅ Yes | ERROR | Duplicate ingestion |
+| PROCESSING_ERROR | FILE | ✅ Yes | ERROR | Technical processing failure |
+
+
+🧾 RECORD-Level Error Codes
+---------------------------
+
+| Error Code | Level | Blocking | Severity | Description |
+| --- | --- | --- | --- | --- |
+| MISSING_PRIMARY_KEY | RECORD | ✅ Yes | ERROR | Missing primary key |
+| DUPLICATE_RECORD | RECORD | ✅ Yes | ERROR | Duplicate records |
+| EMPTY_RECORD | RECORD | ✅ Yes | ERROR | No usable data in record |
+
+
+🧱 FIELD-Level Error Codes
+--------------------------
+
+| Error Code | Level | Blocking | Severity | Description |
+| --- | --- | --- | --- | --- |
+| PARSE_FAILED | FIELD | ✅ Yes | ERROR | Parsing failed (JSON or array JSON) |
+| NULL_NOT_ALLOWED | FIELD | ✅ Yes | ERROR | Mandatory field is null |
+| INVALID_DATE_FORMAT | FIELD | ✅ Yes | ERROR | Date format invalid |
+| INVALID_TYPE | FIELD | ✅ Yes | ERROR | Data type mismatch |
+| CAST_FAILED | FIELD | ✅ Yes | ERROR | Type casting failed |
+
+
+🔢 VALUE-Level Error Codes
+--------------------------
+
+| Error Code | Level | Blocking | Severity | Description |
+| --- | --- | --- | --- | --- |
+| VALUE_OUT_OF_RANGE | VALUE | ✅ Yes | ERROR | Value outside allowed range |
+| INVALID_ENUM | VALUE | ✅ Yes | ERROR | Value not in allowed set |
+| LOGIC_CONFLICT | VALUE | ✅ Yes | ERROR | Logical inconsistency |
+
+* * *
+
+📏 Governance Rules
+===================
+
+The registry enforces strict validation rules:
+
+### ✅ Structural Rules
+
+*   FILE, RECORD, FIELD levels:
+    *   Must have `severity = ERROR`
+    *   Must have `blocking = true`
+
+### ✅ Severity Rules
+
+*   `INFO` severity:
+    *   Must **never** be blocking
+
+### ✅ Mapping Rules
+
+*   Every validation rule must reference a valid error code
+*   Error codes must be defined centrally
+
+* * *
+
+🔄 How This Is Used in Code
+===========================
+
+### ExceptionLogger Flow
+
+1.  Developer logs a validation failure:
+    
+    logger.log(
+    
+        rule="invalid_date_format",
+
+        expected="yyyy-mm-dd"
+    
+    )
+    
+2.  Logger resolves the rule via registry:
+    *   `invalid_date_format → INVALID_DATE_FORMAT`
+3.  Error code defines:
+    *   `validation_level = FIELD`
+    *   `severity = ERROR`
+    *   `is_blocking = true`
+4.  Final structured log is written to Delta table
+    
+
+* * *
+
+⚠️ Important Notes
+==================
+
+*   Do **not** introduce new error codes directly in code
+*   Always define them in the registry first
+*   Prefer reusing existing rules where applicable
+*   Avoid duplicating rules with similar meaning
+
+
+
+
+Event Log 
+
+# **Catalog/Schema/Table details**
+- **Catalog**:`socpophousdata1_dev`
+- **Schema**:`social_census_logs`
+- **Table**:`events`
+
+# **Overview**
+## **Purpose**
+- Capture non-fatal, informational events during processing
+- Provide transparency into data behaviour and rule execution
+- Enable data quality monitoring and trend analysis
+
+## **When to use**
+- For events:
+  - Do not fail pipeline
+  - Provide context or insight into processing 
+
+## **Key Principles**
+- Keep logs structured and concise
+- Use standard `event_type` and `rule_name`
+- Avoid logging every successful record to prevent log explosion
+- Prefer aggregation over row-level logging where possible 
+- Do not duplicate MI details - reference via ID if needed
+
+## **What not to log**
+- Debug messages
+- Execution timing 
+- Every row processed
+- Duplicate or redundant events
+
+
+## **Structure**
+| **Field**  | **Purpose**  |
+| --- | --- |
+| id  | Unique ID for the table, acts as a primary key.  |
+| run_id  | Foreign Key for the pipeline run.  |
+| task_key  | If a workflow has multiple tasks associated with a job, each task is allocated a task key. Can also be used to define steps in multiple step processes.  |
+| source_table  | The table that the data related to the event is sourced from  |
+| target_table  | The table the data related to the event will be output to or stored in.  |
+| event_type  | The type of event that has occurred. For example; ‘coding’, ‘MI_fix’, ‘edit’, ‘imputation’.  |
+| rule_name  | The specific business rule name for the event. Can be blank if no rule is used.  |
+| message  | Descriptive message associated with the event.  |
+| response_id  | Unique ID for the row being observed. Will be ‘person_nbr’ for individuals and ‘dwell_nbr’ for dwellings.  |
+| collection_instnace_id  | Collection Instance Id  |
+| case_id  | Unique ID for a case in salesforce  |
+| variable_name  | The name of the variable being processed in the event.  |
+| created_timestamp_utc  | Timestamp of the log entry being created.  |
+
+## **Logger Code Flow**
+![image.png](/.attachments/image-e5112684-f99e-43f3-9490-c79139b72b26.png)
