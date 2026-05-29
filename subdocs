@@ -1,0 +1,1647 @@
+Analyze the content of ExceptionLogger API wiki page content for documentation. Then, create a structured documentation for users to refer using ExceptionLogger API and provide the output as one single Markdown code block or file.
+
+It includes:
+
+overview
+what the logger does
+how it works
+construction / for_task(...)
+full parameter explanations
+all API methods
+examples
+output behaviour
+where data is saved
+running in different environments
+troubleshooting
+best practices
+
+
+
+ExceptionLogger API
+
+Overview
+
+`ExceptionLogger` is the logging module used to write **Data Contract Technical Validation failures** and **technical processing errors** into the **Exception Logs** Delta table.
+
+It is the implementation behind the Exception Logs design described in the main **Exception Logs** page.  
+Where the main page defines **what the table is for** and **what fields it contains**, this page explains **how to use the logger in code**.
+
+`ExceptionLogger` supports three main usage patterns:
+
+- `log()` — log one exception immediately
+- `log_many()` — log multiple violations for one logical record
+- `log_dataframe()` — log failures from a Spark DataFrame
+
+It integrates with the **Error Code Registry** so developers log using a **rule** (developer-facing identifier), and the logger resolves that into governed metadata such as:
+
+- `error_code`
+- `validation_level`
+- `severity`
+- `is_blocking`
+
+
+
+What ExceptionLogger is used for
+
+Use `ExceptionLogger` when you need to record:
+
+- file-level validation failures
+- record-level validation failures
+- field/value-level validation failures
+- technical failures during parsing, casting, or transformation
+- processing failures that require investigation or remediation
+
+Examples include:
+
+- file not found
+- schema mismatch
+- missing primary key
+- invalid enum
+- date format failure
+- logic conflict
+- parsing or casting failure with stack trace
+
+
+
+What ExceptionLogger is not used for
+
+Do **not** use `ExceptionLogger` for:
+
+- informational process events
+- successful processing steps
+- operational status updates
+- general progress logging
+
+For those scenarios, use **EventLogger** instead.
+
+
+
+Key design behaviour
+
+1. Governance metadata is resolved automatically
+Caller provides:
+
+- `rule`
+
+Logger resolves via the Error Code Registry:
+
+- `error_code`
+- `validation_level`
+- `severity`
+- `is_blocking`
+
+This keeps classification consistent across pipelines.
+
+
+
+2. Observed values are not logged
+For privacy / PIA reasons:
+
+- the API does **not** accept `observed`
+- the exception table has **no `observed` column**
+
+This means raw failing values are not written into the exception logs.
+
+
+
+3. `expected` is not stored as a table column
+The logger may accept:
+
+- `expected`
+
+but it is only used to help generate a human-readable message.  
+It is **not stored** as a dedicated column in the exception table.
+
+
+
+4. `id` and timestamp are framework-managed
+The logger automatically generates:
+
+- `id` — UUID
+- `created_timestamp_utc` — UTC timestamp
+
+Callers do not pass these values directly.
+
+
+5. `job_id` is not stored in Exception Logs
+The exception table stores:
+
+- `run_id`
+
+but **does not** store `job_id`.  
+If `job_id` is needed for investigation, exception logs should be joined to the pipeline log table using `run_id`.
+
+
+
+6. Buffering and auto-flush
+Records are buffered in memory and written in batches.
+
+Flush happens when:
+
+- buffer reaches `batch_size`
+- the logger exits a `with` block
+- `flush()` is called explicitly
+
+
+
+Where the output is written
+
+Default table (dev)
+- `socpophousdata1_dev.social_census_logs.exceptions`
+
+### Other ways to control output table
+You can override the output table using:
+
+- `log_table_path=...` in `for_task(...)`
+- environment variable: `CENSUS_EXCEPTION_LOG_TABLE`
+
+
+
+
+
+How ExceptionLogger works internally
+
+ General flow
+1. Caller creates the logger using `ExceptionLogger.for_task(...)`
+2. Logger builds a `RunContext`
+3. Logger validates the target Delta table schema
+4. Caller logs exceptions using one of:
+   - `log()`
+   - `log_many()`
+   - `log_dataframe()`
+5. Logger resolves the `rule` via the Error Code Registry
+6. Logger builds a structured exception record
+7. Record is buffered
+8. Buffered records are flushed to Delta
+
+
+
+ Construction
+
+ `ExceptionLogger.for_task(...)`
+
+This is the recommended way to create a logger.
+
+It handles:
+- loading the registry
+- building the run context
+- resolving the output table
+- setting buffer size
+
+ Signature (conceptual)
+
+
+ExceptionLogger.for_task(
+    spark,
+    *,
+    collection_instance_id=None,
+    task_key=None,
+    source_table=None,
+    target_table=None,
+    log_table_path=None,
+    registry_path=None,
+    batch_size=1000,
+)
+
+
+
+
+Parameters
+
+spark (required)
+Active SparkSession.
+Used for:
+
+schema validation
+DataFrame creation
+writing to the Delta table
+
+
+collection_instance_id (optional)
+Default collection instance identifier for this logger.
+Use this when:
+
+all exceptions in the task relate to the same collection instance
+
+In DataFrame logging, this can be overridden per row using:
+
+collection_instance_id_column
+
+If omitted, the value may be NULL unless overridden.
+
+task_key (optional)
+Task key for the current workflow step.
+If omitted:
+
+Databricks Job task_key is used when available
+otherwise defaults to "unknown"
+
+Useful when:
+
+one notebook contains multiple logical processing stages
+you want more precise task attribution in logs
+
+
+source_table (optional)
+Upstream/source table relevant to the exception.
+Useful for traceability and investigation.
+
+target_table (optional)
+Downstream/target table relevant to the exception.
+Useful for traceability and investigation.
+
+log_table_path (optional)
+Override the default exceptions table.
+Use this when:
+
+writing to tst / uat / prd
+writing to a custom dev table
+testing against a temporary table
+
+
+registry_path (optional)
+Override the default Error Code Registry YAML path.
+Useful for:
+
+unit tests
+trying alternate registry definitions
+
+
+batch_size (optional)
+Number of records to buffer before auto-flush.
+Higher batch sizes:
+
+reduce number of writes
+increase in-memory buffering
+
+Lower batch sizes:
+
+flush more frequently
+useful in small tasks or tests
+
+
+Example
+
+from utils.logger import ExceptionLogger
+
+with ExceptionLogger.for_task(
+    spark=spark,
+    collection_instance_id="2027-CAS-001",
+    source_table="socpophousdata1_dev.social_census_parsed.individual",
+    target_table="socpophousdata1_dev.social_census_validated.individual",
+) as logger:
+    ...
+
+
+
+API Methods
+1. log() — log one exception
+Use log() when you need to write a single exception immediately.
+This is the best method for:
+
+try/except blocks
+one-off validation failures
+technical failures with stack traces
+file-level failures
+record-level failures not naturally produced as a DataFrame
+
+
+Signature (conceptual)
+
+logger.log(
+    *,
+    rule,
+    event_type,
+    variable_name=None,
+    expected=None,
+    response_id=None,
+    case_id=None,
+    message=None,
+    stack_trace=None,
+)
+
+Parameters
+rule (required)
+Developer-facing validation rule name.
+This must exist in the Error Code Registry.
+Examples:
+
+invalid_date_format
+null_not_allowed
+value_out_of_range
+duplicate_record
+
+Used to derive:
+
+error_code
+validation_level
+severity
+is_blocking
+
+
+event_type (required)
+Type/category of exception.
+Examples:
+
+DATACONTRACTVALIDATION
+ODCS
+other project-specific categories if used
+
+This field helps downstream filtering and grouping.
+
+variable_name (optional)
+Name of the variable/field related to the failure.
+Use this when the failure is tied to a specific variable, for example:
+
+i_age
+i_mode
+i_submitted_date_time
+
+Can be omitted for:
+
+FILE-level failures
+RECORD-level failures not tied to one variable
+
+
+expected (optional)
+Expected value, pattern, range, or rule expectation.
+Examples:
+
+"yyyy-mm-dd"
+"Online | Phone | Visit"
+"0..120"
+
+Important:
+
+used only for message generation
+not stored as a dedicated column
+
+
+response_id (optional)
+Identifier of the row/record involved in the failure.
+Examples:
+
+person_nbr
+dwell_nbr
+
+May be null for:
+
+file-level failures
+failures not tied to one record
+
+
+case_id (optional)
+Salesforce case identifier or similar case-level identifier.
+Use when available.
+
+message (optional)
+Custom human-readable message.
+If omitted:
+
+the logger generates a default message using rule and (optionally) expected
+
+Use custom messages when:
+
+you want more context
+expected alone is not descriptive enough
+technical failure needs a clearer explanation
+
+
+stack_trace (optional)
+Traceback string for technical exceptions.
+Typically created using:
+
+traceback.format_exc()
+
+Use only for technical failures where traceback is helpful.
+
+Example: validation failure
+
+logger.log(
+    rule="invalid_date_format",
+    event_type="DATACONTRACTVALIDATION",
+    variable_name="i_submitted_date_time",
+    expected="iso-8601",
+    response_id="P123456789",
+    case_id="500Mp00000d56UCIAY",
+)
+
+Example: technical failure with stack trace
+
+import traceback
+
+try:
+    int("not-an-integer")
+except Exception:
+    logger.log(
+        rule="invalid_type",
+        event_type="DATACONTRACTVALIDATION",
+        variable_name="demo_numeric_field",
+        expected="integer",
+        response_id="P123456789",
+        case_id="500Mp00000d56UCIAY",
+        message="Technical failure while parsing demo_numeric_field as integer.",
+        stack_trace=traceback.format_exc(),
+    )
+
+
+2. log_many() — multiple violations for one logical record
+Use log_many() when one record fails multiple validation rules.
+This is the best method when:
+
+you already have a Python list of Violation
+one response/case has many problems
+you want all those failures logged in one batch
+
+
+Signature (conceptual)
+
+logger.log_many(
+    violations,
+    *,
+    event_type,
+    response_id=None,
+    case_id=None,
+    stack_trace=None,
+)
+
+
+
+Parameters
+violations (required)
+Iterable of Violation objects.
+Each Violation can contain:
+
+rule (required)
+variable_name (optional)
+expected (optional)
+message (optional)
+
+
+event_type (required)
+Shared event type for all violations in the batch.
+Usually:
+
+DATACONTRACTVALIDATION
+
+
+response_id (optional)
+Shared response identifier for all violations in this batch.
+Use when all violations relate to one record.
+
+case_id (optional)
+Shared case identifier for all violations in this batch.
+
+stack_trace (optional)
+Shared traceback string applied to all violations in the batch.
+Rare, but useful when a technical failure produced multiple related violations.
+
+Example
+from utils.logger import Violation
+
+violations = [
+    Violation(
+        rule="null_not_allowed",
+        variable_name="person_nbr",
+        message="person_nbr is required",
+    ),
+    Violation(
+        rule="invalid_enum",
+        variable_name="i_mode",
+        expected="Online | Phone | Visit",
+    ),
+    Violation(
+        rule="value_out_of_range",
+        variable_name="i_age",
+        expected="0..120",
+    ),
+]
+
+logger.log_many(
+    violations,
+    event_type="DATACONTRACTVALIDATION",
+    response_id="P99999",
+    case_id="CASE-999",
+)
+
+
+
+
+3. log_dataframe() — bulk logging from a Spark DataFrame
+Use log_dataframe() when validation produces a DataFrame of failures.
+This is the best method for:
+
+set-based Spark validation
+one-row-per-failure outputs
+validations done across thousands/millions of rows
+avoiding Python loops over collected failures
+
+
+Signature (conceptual)
+
+logger.log_dataframe(
+    df,
+    *,
+    rule,
+    event_type,
+    variable_name=None,
+    variable_name_column=None,
+    expected=None,
+    response_id_column,
+    case_id_column=None,
+    collection_instance_id_column=None,
+    message=None,
+    message_column=None,
+    stack_trace=None,
+)
+
+
+
+
+Required parameters
+df (required)
+Spark DataFrame containing one row per failure.
+
+rule (required)
+Registry rule applied to every row in the failure DataFrame.
+Examples:
+
+null_not_allowed
+invalid_enum
+value_out_of_range
+
+
+event_type (required)
+Event category applied to every row.
+Usually:
+
+DATACONTRACTVALIDATION
+
+
+response_id_column (required)
+Name of the DataFrame column that contains the response ID for each row.
+Examples:
+
+"person_nbr"
+"dwell_nbr"
+
+This is required because log_dataframe() is row-scoped.
+
+Optional per-row column parameters
+case_id_column (optional)
+Name of the DataFrame column containing case IDs.
+Example:
+
+"i_id"
+
+
+collection_instance_id_column (optional)
+Name of the DataFrame column containing collection instance IDs.
+If provided:
+
+per-row values are used
+
+If omitted:
+
+logger falls back to the default collection instance from context
+
+
+variable_name_column (optional)
+Name of the DataFrame column that tells the logger which variable failed on each row.
+Use this when:
+
+one DataFrame contains failures across multiple variables
+
+Example values inside the column:
+
+i_mode
+person_nbr
+i_age
+
+
+message_column (optional)
+Name of the DataFrame column containing the per-row message text.
+Use this when:
+
+each failure row should have its own specific message
+
+
+Optional constant parameters
+variable_name (optional)
+Constant variable name applied to every row.
+Use this when:
+
+the entire DataFrame represents failures for one variable
+
+Mutually exclusive with:
+
+variable_name_column
+
+
+expected (optional)
+Constant expected value/pattern/range applied to every row.
+Used only for message generation.
+Examples:
+
+"0..120"
+"Online | Phone | Visit"
+"iso-8601"
+
+
+message (optional)
+Constant message applied to every row.
+Mutually exclusive with:
+
+message_column
+
+If both message and message_column are omitted:
+
+logger auto-generates a default message using rule and expected
+
+
+stack_trace (optional)
+Constant traceback string applied to every row.
+Mostly useful if the DataFrame represents rows impacted by one technical failure.
+
+Mutual exclusivity rules
+Do not pass both of the following pairs together:
+
+variable_name and variable_name_column
+message and message_column
+
+If both are passed, the logger raises ValueError.
+
+Common shapes of log_dataframe()
+A. One-variable validation
+Example: age range check
+
+
+
+invalid_age_df = df.filter((df.i_age < 0) | (df.i_age > 120))
+
+logger.log_dataframe(
+    invalid_age_df,
+    rule="value_out_of_range",
+    event_type="DATACONTRACTVALIDATION",
+    variable_name="i_age",
+    expected="0..120",
+    response_id_column="person_nbr",
+    case_id_column="i_id",
+)
+
+
+
+Use this shape when:
+
+all rows refer to the same variable
+message can be generated automatically or is constant
+
+
+B. Multi-variable normalized failures
+Example: mandatory field validator across multiple columns
+
+
+logger.log_dataframe(
+    failures_df,
+    rule="null_not_allowed",
+    event_type="DATACONTRACTVALIDATION",
+    response_id_column="person_nbr",
+    variable_name_column="failed_variable",
+    message_column="failure_message",
+    collection_instance_id_column="collectionInstance",
+)
+
+
+
+Use this shape when:
+
+one DataFrame spans multiple variables
+each row can tell you which variable failed
+
+
+C. Constant message override
+
+logger.log_dataframe(
+    invalid_enum_df,
+    rule="invalid_enum",
+    event_type="DATACONTRACTVALIDATION",
+    variable_name="i_mode",
+    expected="Online | Phone | Visit",
+    response_id_column="person_nbr",
+    message="Response mode is not one of the allowed values.",
+)
+
+
+
+
+Use this when:
+
+you want a single clean message for all rows
+
+
+How records are built
+For each exception record, the logger writes:
+Framework-managed
+
+id
+created_timestamp_utc
+
+Run/task context
+
+run_id
+task_key
+source_table
+target_table
+
+Registry-derived
+
+error_code
+validation_level
+severity
+is_blocking
+
+Caller/data-driven
+
+event_type
+message
+response_id
+case_id
+collection_instance_id
+variable_name
+stack_trace
+
+
+Buffering and flushing
+How buffering works
+The logger stores records in memory until:
+
+buffer size reaches batch_size, or
+flush() is called, or
+the context manager exits
+
+Why use a context manager
+Using:
+
+
+with ExceptionLogger.for_task(...) as logger:
+    ...
+
+
+
+ensures that:
+
+buffered rows are flushed at the end of the block
+you don’t accidentally lose the last few records
+
+
+Running in different environments
+Option 1 — override the log table path
+Use this when writing to a different catalog/schema/table:
+
+
+
+with ExceptionLogger.for_task(
+    spark=spark,
+    log_table_path="socpophousdata1_tst.social_census_logs.exceptions",
+) as logger:
+    …
+
+
+
+
+Option 2 — use environment variable
+Set:
+
+CENSUS_EXCEPTION_LOG_TABLE
+
+Then ExceptionLogger.for_task(...) will pick that up automatically.
+
+Table creation / migration
+Before using the logger in a new environment, run:
+
+src/utils/logger/create_log_tables.sql
+
+
+
+This creates the required tables with the expected schema.
+If the schema does not match, logger construction fails with:
+
+TableContractError
+
+
+Troubleshooting
+TableContractError: schema mismatch
+Cause
+The deployed Delta table does not match the logger’s schema.
+What to check
+
+Does the table have id instead of observation_id?
+Has job_id been removed?
+Are case_id and collection_instance_id present?
+Is there no observed / expected column?
+
+Fix
+
+Apply the latest create_log_tables.sql
+Or migrate the table schema to match the logger
+
+
+No logs written to the table
+Possible causes
+
+buffer never flushed
+not using with
+write failure occurred and was raised upstream
+
+Fix
+
+use the logger inside a context manager
+call flush() explicitly if needed
+
+
+ValueError: not both
+This happens when mutually exclusive parameters are passed together.
+Examples
+
+variable_name + variable_name_column
+message + message_column
+
+Fix
+Choose one mode:
+
+constant value
+or per-row column
+
+
+Sensitive values appearing in messages
+Although observed values are not accepted by the API, a caller could still include sensitive values in a custom message.
+Guidance
+
+keep custom messages descriptive but non-sensitive
+avoid embedding raw record data in message text
+
+
+Best practices
+
+Use log() for single failures and technical exceptions
+Use log_many() for multiple failures on one record
+Use log_dataframe() for Spark-generated failure DataFrames
+Prefer context-manager usage (with ...) so flush is automatic
+Use stack_trace only for technical failures
+Use case_id when available for Salesforce correlation
+Keep custom messages clean and non-sensitive
+Do not invent error codes directly in code — use registry rules
+
+
+
+
+
+
+
+Analyze the content of EventLogger API wiki page content for documentation. Then, create a structured documentation for users to refer using EventLogger API and provide the output as one single Markdown code block or file.
+
+
+# EventLogger API
+
+## Overview
+
+`EventLogger` is the logging module used to write **non-fatal, informational processing events** into the **Event Logs** Delta table.
+
+It is the implementation behind the Event Logs design described in the main **Event Logs** page.  
+Where the main page explains **what the table is for** and **what fields it contains**, this page explains **how to use the logger in code**.
+
+`EventLogger` is intended for events that:
+
+- do **not** fail the pipeline
+- provide context or transparency into processing
+- help explain what happened during a step
+- support monitoring, audit, and investigation of processing behaviour
+
+It supports two main usage patterns:
+
+- `log()` — write one event immediately
+- `log_dataframe()` — write many row-level events from a Spark DataFrame
+
+Unlike `ExceptionLogger`, `EventLogger` does **not** use the Error Code Registry.
+
+---
+
+## What EventLogger is used for
+
+Use `EventLogger` when you want to record:
+
+- coding activity
+- imputation actions
+- manual interventions
+- review flags
+- operational checkpoints
+- informational validation outcomes
+- row-level events that are useful but not exceptions
+
+Examples include:
+
+- “Applied coding rule successfully”
+- “Record routed for manual review”
+- “DOB imputed using age distribution”
+- “Validation step completed”
+- “Classification output generated”
+
+---
+
+## What EventLogger is not used for
+
+Do **not** use `EventLogger` for:
+
+- validation failures requiring governance classification
+- data contract rule failures
+- technical failures that should be treated as exceptions
+- stack-trace-driven error logging
+
+For those scenarios, use **ExceptionLogger** instead.
+
+---
+
+## Key design behaviour
+
+### 1. No registry lookup
+`EventLogger` does not resolve governance metadata such as:
+
+- `error_code`
+- `severity`
+- `validation_level`
+- `is_blocking`
+
+This is because events are informational and not governed exception records.
+
+---
+
+### 2. Message is required
+Every event must have a message.
+
+- In `log()`, `message` is required.
+- In `log_dataframe()`, exactly one of:
+  - `message`
+  - `message_column`
+
+must be supplied.
+
+---
+
+### 3. Rule name is optional
+`rule_name` is free text and optional.
+
+It can be supplied:
+- as a constant (`rule_name`)
+- per row in a DataFrame (`rule_name_column`)
+
+Use it when the event relates to a named business rule or process rule.
+
+---
+
+### 4. `id` and timestamp are framework-managed
+The logger automatically generates:
+
+- `id` — UUID
+- `created_timestamp_utc` — UTC timestamp
+
+Callers do not pass these values directly.
+
+---
+
+### 5. `job_id` is not stored in Event Logs
+The event table stores:
+
+- `run_id`
+
+but intentionally does **not** store `job_id`.
+
+If `job_id` is needed:
+- join to the pipeline log table using `run_id`
+
+---
+
+### 6. `collection_instance_id` can come from context or DataFrame
+For single-record logging:
+- `collection_instance_id` comes from logger context (created via `for_task(...)`)
+
+For DataFrame logging:
+- `collection_instance_id_column` can override the context value per row
+
+---
+
+### 7. Buffering and auto-flush
+Records are buffered and written in batches.
+
+Flush happens when:
+
+- buffer reaches `batch_size`
+- exiting a `with` block
+- `flush()` is called explicitly
+
+---
+
+## Where the output is written
+
+### Default table (dev)
+- `socpophousdata1_dev.social_census_logs.events`
+
+### Other ways to control output table
+You can override the output table using:
+
+- `log_table_path=...` in `for_task(...)`
+- environment variable: `CENSUS_EVENT_LOG_TABLE`
+
+---
+
+## Event table output fields
+
+The events table contains the following fields:
+
+- `id`
+- `run_id`
+- `task_key`
+- `source_table`
+- `target_table`
+- `event_type`
+- `rule_name`
+- `message`
+- `response_id`
+- `case_id`
+- `collection_instance_id`
+- `variable_name`
+- `created_timestamp_utc`
+
+These are described in detail on the main **Event Logs** page.
+
+---
+
+## How EventLogger works internally
+
+### General flow
+1. Caller creates the logger using `EventLogger.for_task(...)`
+2. Logger builds a `RunContext`
+3. Logger validates the target Delta table schema
+4. Caller logs events using:
+   - `log()`
+   - `log_dataframe()`
+5. Logger builds a structured event record
+6. Record is buffered
+7. Buffered records are flushed to Delta
+
+---
+
+## Construction
+
+## `EventLogger.for_task(...)`
+
+This is the recommended way to create a logger.
+
+It handles:
+- building run context
+- resolving the output table
+- validating table schema
+- setting batch size
+
+### Signature (conceptual)
+
+```python
+EventLogger.for_task(
+    spark,
+    *,
+    collection_instance_id=None,
+    task_key=None,
+    source_table=None,
+    target_table=None,
+    log_table_path=None,
+    batch_size=1000,
+)
+``
+
+
+Parameters
+spark (required)
+Active SparkSession.
+Used for:
+
+schema validation
+DataFrame creation
+writing to Delta
+
+
+collection_instance_id (optional)
+Default collection instance identifier for this logger.
+Use this when:
+
+all events in the task relate to the same collection instance
+
+In DataFrame logging, this can be overridden per row using:
+
+collection_instance_id_column
+
+If omitted, the value may be NULL unless overridden.
+
+task_key (optional)
+Task key for the current workflow step.
+If omitted:
+
+Databricks Job task_key is used when available
+otherwise defaults to "unknown"
+
+Useful when:
+
+one notebook performs multiple logical steps
+you want finer-grained task attribution in logs
+
+
+source_table (optional)
+Upstream/source table relevant to the event.
+Useful for traceability.
+
+target_table (optional)
+Downstream/target table relevant to the event.
+Useful for traceability.
+
+log_table_path (optional)
+Override the default events table.
+Use this when:
+
+writing to tst / uat / prd
+writing to a custom dev table
+testing against a temporary table
+
+
+batch_size (optional)
+Number of records to buffer before auto-flush.
+Higher batch sizes:
+
+reduce number of writes
+increase in-memory buffering
+
+Lower batch sizes:
+
+flush more frequently
+useful in small tasks or tests
+
+
+Example
+
+from utils.logger import EventLogger
+
+with EventLogger.for_task(
+    spark=spark,
+    collection_instance_id="2027-CAS-001",
+    source_table="socpophousdata1_dev.social_census_parsed.individual",
+    target_table="socpophousdata1_dev.social_census_classified.individual",
+) as logger:
+    ...
+
+
+
+
+API Methods
+1. log() — log one event
+Use log() when you need to write a single informational or operational event immediately.
+This is the best method for:
+
+one-off process events
+coding or imputation step notes
+manual review routing messages
+step completion / status events
+simple row-level events emitted inline
+
+
+Signature (conceptual)
+
+logger.log(
+    *,
+    event_type,
+    message,
+    rule_name=None,
+    response_id=None,
+    case_id=None,
+    variable_name=None,
+)
+
+
+Parameters
+event_type (required)
+Type/category of event.
+Examples:
+
+coding
+imputation
+validation
+review
+manual_intervention
+
+This field helps downstream filtering and grouping.
+
+message (required)
+Human-readable description of what happened.
+Examples:
+
+Applied coding rule successfully
+DOB imputed using age distribution
+Record flagged for manual review
+
+This is required because events are intended to be human-readable operational records.
+
+rule_name (optional)
+Specific business/process rule associated with the event.
+Examples:
+
+ethnic_group_coding_v1
+dob_imputation_v2
+manual_review_routing_rule
+
+Unlike ExceptionLogger’s rule, this is free text and is not registry-controlled.
+
+response_id (optional)
+Identifier of the row/record being observed.
+Examples:
+
+person_nbr
+dwell_nbr
+
+Optional because some events may be task-level rather than row-level.
+
+case_id (optional)
+Case identifier associated with the event.
+Use when available (for example Salesforce case id).
+
+variable_name (optional)
+Name of the variable involved in the event.
+Examples:
+
+i_age
+i_mode
+ethnic_group
+
+Use when the event is tied to one variable.
+
+Example
+
+logger.log(
+    event_type="coding",
+    message="Applied ethnic group coding rules successfully",
+    rule_name="ethnic_group_coding_v1",
+    response_id="P12345",
+    case_id="500Mp00000d56UCIAY",
+    variable_name="ethnic_group",
+)
+
+
+2. log_dataframe() — bulk logging from a Spark DataFrame
+Use log_dataframe() when you have a Spark DataFrame where each row represents one event to log.
+This is the best method for:
+
+row-level imputation outcomes
+manual review routing results
+bulk processing notes attached to many rows
+any event already represented in a DataFrame
+
+
+Signature (conceptual)
+
+logger.log_dataframe(
+    df,
+    *,
+    event_type,
+    rule_name=None,
+    rule_name_column=None,
+    message=None,
+    message_column=None,
+    response_id_column,
+    case_id_column=None,
+    collection_instance_id_column=None,
+    variable_name=None,
+    variable_name_column=None,
+)
+
+
+Required parameters
+df (required)
+Spark DataFrame containing one row per event to be logged.
+
+event_type (required)
+Event category applied to every row.
+Examples:
+
+coding
+imputation
+review
+validation
+
+
+response_id_column (required)
+Name of the DataFrame column containing response IDs for each row.
+Examples:
+
+"person_nbr"
+"dwell_nbr"
+
+This is required because bulk event logging is row-scoped.
+
+message or message_column (required: exactly one)
+You must provide one of:
+
+message — one constant message applied to every row
+message_column — a DataFrame column containing per-row message text
+
+
+Optional per-row column parameters
+rule_name_column (optional)
+Name of the DataFrame column containing per-row rule names.
+Use when each row has a different rule/process name.
+Example values inside the column:
+
+dob_imputation_v1
+coding_rule_a
+manual_review_routing
+
+
+case_id_column (optional)
+Name of the DataFrame column containing case IDs.
+Example:
+
+"i_id"
+
+
+collection_instance_id_column (optional)
+Name of the DataFrame column containing collection instance IDs.
+If provided:
+
+per-row values are written
+
+If omitted:
+
+logger uses the default context value from for_task(...)
+
+
+variable_name_column (optional)
+Name of the DataFrame column containing per-row variable names.
+Use when:
+
+the DataFrame spans multiple variables
+
+Example values inside the column:
+
+i_age
+i_mode
+i_dob_year
+
+
+Optional constant parameters
+rule_name (optional)
+Constant rule name applied to every row.
+Use this when the entire DataFrame relates to the same process/business rule.
+Mutually exclusive with:
+
+rule_name_column
+
+
+message (optional alternative to message_column)
+Constant message applied to every row.
+Mutually exclusive with:
+
+message_column
+
+
+variable_name (optional)
+Constant variable name applied to every row.
+Use when the entire DataFrame relates to one variable.
+Mutually exclusive with:
+
+variable_name_column
+
+
+Mutual exclusivity rules
+Do not pass both of the following pairs together:
+
+message and message_column
+rule_name and rule_name_column
+variable_name and variable_name_column
+
+If both are passed, the logger raises ValueError.
+
+Common shapes of log_dataframe()
+A. Constant message, constant rule name
+Use this when:
+
+all event rows are the same kind of event
+one message describes all rows
+one rule/process name describes all rows
+
+
+logger.log_dataframe(
+    df_imputed,
+    event_type="imputation",
+    rule_name="dob_imputation_v1",
+    message="DOB imputed using age distribution",
+    response_id_column="person_nbr",
+    case_id_column="i_id",
+    variable_name="i_dob_year",
+)
+
+
+
+B. Per-row message
+Use this when:
+
+each row has its own message text
+
+logger.log_dataframe(
+    df_events,
+    event_type="review",
+    message_column="event_message",
+    response_id_column="person_nbr",
+    case_id_column="i_id",
+)
+
+
+
+C. Per-row message + per-row rule name
+Use this when:
+
+each row may be explained by a different rule/process
+
+logger.log_dataframe(
+    df_events,
+    event_type="review",
+    message_column="event_message",
+    rule_name_column="rule_applied",
+    response_id_column="person_nbr",
+    case_id_column="i_id",
+    variable_name_column="variable_name",
+    collection_instance_id_column="collectionInstance",
+)
+
+
+D. Per-row collection instance override
+Use this when:
+
+one DataFrame spans multiple collection instances
+
+
+logger.log_dataframe(
+    df_events,
+    event_type="coding",
+    message_column="msg",
+    response_id_column="person_nbr",
+    collection_instance_id_column="collectionInstance",
+)
+
+
+How records are built
+For each event record, the logger writes:
+Framework-managed
+
+id
+created_timestamp_utc
+
+Run/task context
+
+run_id
+task_key
+source_table
+target_table
+
+Caller/data-driven
+
+event_type
+rule_name
+message
+response_id
+case_id
+collection_instance_id
+variable_name
+
+
+Buffering and flushing
+How buffering works
+The logger stores records in memory until:
+
+buffer reaches batch_size
+flush() is called
+the context manager exits
+
+Why use a context manager
+Using:
+
+with EventLogger.for_task(...) as logger:
+    …
+
+
+ensures:
+
+buffered rows are flushed automatically at the end of the block
+you don’t accidentally leave unwritten rows in memory
+
+
+Running in different environments
+Option 1 — override the log table path
+Use this when writing to a different catalog/schema/table:
+
+
+with EventLogger.for_task(
+    spark=spark,
+    log_table_path="socpophousdata1_tst.social_census_logs.events",
+) as logger:
+    …
+
+
+
+Option 2 — use environment variable
+Set:
+CENSUS_EVENT_LOG_TABLE
+Then EventLogger.for_task(...) will pick that up automatically.
+
+Table creation / migration
+Before using the logger in a new environment, run:
+
+src/utils/logger/create_log_tables.sql
+
+
+If the table schema does not match the logger schema, construction fails with:
+
+TableContractError
+
+
+Troubleshooting
+TableContractError: schema mismatch
+Cause
+The deployed Delta table schema does not match the logger schema.
+What to check
+
+Does the table have id instead of observation_id?
+Has job_id been removed?
+Is case_id present?
+Is collection_instance_id present?
+
+Fix
+
+Apply the latest create_log_tables.sql
+Or migrate the table schema
+
+
+No logs written to the table
+Possible causes
+
+logger buffer was never flushed
+not using a with block
+write failure occurred and was raised
+
+Fix
+
+use a context manager
+or call flush() explicitly
+
+
+ValueError: every event needs a message
+This occurs when log_dataframe() is called without:
+
+message
+and without message_column
+
+Fix
+Provide exactly one of:
+
+message
+message_column
+
+
+ValueError: not both
+This occurs when mutually exclusive arguments are supplied together.
+Common examples
+
+message + message_column
+rule_name + rule_name_column
+variable_name + variable_name_column
+
+Fix
+Choose either:
+
+a constant value
+or a per-row column
+
+
+rule_name not appearing as expected
+If each row has a different rule/process name, use:
+
+rule_name_column
+
+If every row has the same rule/process name, use:
+
+rule_name
+
+
+Best practices
+
+Use log() for one-off operational events
+Use log_dataframe() when events are already available in a Spark DataFrame
+Avoid logging every successful row unless it adds real business value
+Prefer aggregated or meaningful row-level events over log explosion
+Use rule_name_column when different rows correspond to different rules
+Use case_id when available for Salesforce correlation
+Use collection_instance_id_column when DataFrame rows span multiple collection instances
+Always use a context manager for automatic flush
