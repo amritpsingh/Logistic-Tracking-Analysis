@@ -1,0 +1,3686 @@
+As we discussed in previous discussions, I am working on this census data processing project.
+
+In this project, we have different stages of medallion architecture:
+Stage 1 is ESS0 - Data come from other systems and stored in ESS0 tables. ESS0 has 3 tables:
+	census_df - Metadata + json blob from dwelling form
+	census_hsf - Metadata + json blob from household form
+	census_if - Metadata + json blob from individual form
+
+Stage 2 is ESS1 - Data is parsed from ESS0 and stored in ESS1 tables. ESS1 has 3 tables:
+	dwelling - Social Census dwelling form parsed data
+	household - Social Census household form parsed data
+	individual - Social Census individual form parsed data
+
+Stage 3 is ESS2 - The data from ESS1 is cleansed and technically validated, then fed into ESS2.
+
+Similarly, there is ESS3 and ESS4.
+
+Now, The first task is to move data from ESS0 to ESS1. For this task, there is parsing module developed by my teammate. I have integrated logging module in parsing process. 
+
+You are a expert Principal data engineer with 20 years of experience in implementing data solutions for very complex scenarios and have expertise in databricks, Pyspark, Python and sql. your task is to analyse the code, the parsing process, how parsing process gets info from yaml files and processes data for each form. Analyse how logging is working in the parsing. Also look for if there is any redundant code, duplicate code or functions doing the same work. review every code and different functions multiple time. Analyse every possible scenario. Do not rush and take as much as time needed.
+
+
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/individual_form_parsing
+
+from definitions import spark
+from transformations.parsing_orchestrator import run_parsing_job
+
+run_parsing_job(
+    spark=spark,
+    config_file="individual/individual_parsing",
+)
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/household_form_parsing
+
+from definitions import spark
+from transformations.parsing_orchestrator import run_parsing_job
+
+run_parsing_job(
+    spark=spark,
+    config_file="household/dwelling_person_parsing"
+)
+
+run_parsing_job(
+    spark=spark,
+    config_file="household/household_parsing"
+)
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/dwelling_form_parsing
+
+from definitions import spark
+from transformations.parsing_orchestrator import run_parsing_job
+
+run_parsing_job(
+    spark=spark,
+    config_file="dwelling/dwelling_parsing"
+)
+
+
+SPH_Survey_Data_Sourcing/src/transformations/parsing.py
+
+# parsing.py
+
+from config_models.transformation_config import VariableConfig
+from transformations.abstract_transformation import AbstractTransformation
+
+from functools import reduce
+
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    col,
+    from_json,
+    expr,
+    current_timestamp,
+    posexplode,
+    explode,
+    length,
+    lit,
+    when,
+    nullif,
+    trim,
+    size
+)
+from pyspark.sql.types import (
+    MapType,
+    StringType,
+    ArrayType
+)
+
+
+# Source record identity columns available in all parsing input YAMLs.
+SOURCE_ID_COLUMNS = ("collectionInstance", "responseId", "caseId")
+
+
+# YAML type → Spark SQL type for ANSI-safe try_cast.
+_TRY_CAST_TYPES = {
+    "int": "int",
+    "integer":   "int",
+    "tinyint":   "tinyint",
+    "short":     "smallint",
+    "long":      "bigint",
+    "timestamp": "timestamp",
+}
+
+
+class Parsing(AbstractTransformation):
+    def __init__(self, spark, config_file: str):
+        super().__init__(spark, config_file)
+
+    # ──────────────────────────────────────────────────────────────
+    # Expression formats can be anything in the left column and then
+    # gets rewrite to the expression in the right column
+    #   data:a              → data_json['a']
+    #   data:a:b:c          → get_json_object(data_json['a'], '$.b.c')
+    #   loop_x:y:z          → get_json_object(loop_x_json['y'], '$.z')
+    # ──────────────────────────────────────────────────────────────
+    def _rewrite_json_expression(self, expression: str, json_scopes: set) -> str:
+        # Fast exit for when ":" not in expression
+        if ":" not in expression:
+            return expression
+
+        parts = expression.split(":")
+        scope = parts[0]
+        keys = parts[1:]
+
+        # Only rewrite known JSON scopes
+        if scope not in json_scopes:
+            return expression
+
+        # Base map access
+        base = f"{scope}_json['{keys[0]}']"
+
+        # Simple access: data:key
+        if len(keys) == 1:
+            return base
+
+        # Nested JSON inside string → get_json_object
+        json_path = ".".join(keys[1:])
+        return f"get_json_object({base}, '$.{json_path}')"
+
+
+
+    # Build a Spark column from variable config (non-explode only)
+    def _build_column(self, variable: VariableConfig, json_scopes: set):
+        name = variable.name
+        var_type = variable.type
+
+        alias = getattr(variable, "alias", None)
+        expression = getattr(variable, "expression", None)
+
+        # Explode expressions handled earlier
+        if expression and expression.startswith(("explode:", "posexplode:")):
+            return None
+
+        # ── Expression
+        if expression:
+            spark_expr = self._rewrite_json_expression(expression, json_scopes)
+            col_expr = expr(spark_expr)
+            expr_str = spark_expr  # Track the original SQL string
+
+        elif alias:
+            col_expr = col(alias)
+            expr_str = alias
+
+        else:
+            raise ValueError(
+                f"Variable '{name}' must define either 'expression' or 'alias'"
+            )
+
+        # ── Type casting
+        if var_type == "string":
+            col_expr = col_expr.cast("string")
+        elif var_type in _TRY_CAST_TYPES:
+            sql_type = _TRY_CAST_TYPES[var_type]
+            col_expr = expr(
+                f"try_cast(nullif(replace(trim(cast(({expr_str}) as string)), ',', ''), '') as {sql_type})"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported type {var_type!r} for variable {name!r}."
+            )
+
+        return col_expr.alias(name)
+
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _nonblank(column_expression):
+        """
+        Column predicate: value is not null and not empty after trimming.
+        """
+        return column_expression.isNotNull() & (
+            length(trim(column_expression.cast("string"))) > 0
+        )
+
+
+    def _failure_columns(self, *, variable_name: str, failure_type: str, message: str):
+        return [
+            col("collectionInstance").cast("string").alias("collectionInstance"),
+            col("responseId").cast("string").alias("responseId"),
+            col("caseId").cast("string").alias("caseId"),
+            lit(variable_name).alias("variable_name"),
+            lit(failure_type).alias("failure_type"),
+            lit(message).alias("message"),
+        ]
+
+    def _get_json_input_columns(self) -> set:
+        """
+        Names of input variables declared as type: json in YAML.
+        """
+        return {
+            input_variable.name
+            for input_dataset in self._transform_config.input_datasets
+            for input_variable in (input_dataset.variables or [])
+            if getattr(input_variable, "type", None) == "json"
+        }
+
+
+    def _get_explode_specs(self) -> list:
+        """
+        Collect explode / posexplode specs from output variables.
+        """
+        output_vars = self._transform_config.output_datasets[0].variables
+        explode_specs = []
+
+        for output_variable in output_vars:
+            expression = getattr(output_variable, "expression", None)
+            if not expression:
+                continue
+
+            if expression.startswith(("explode:", "posexplode:")):
+                explode_type, scope, path = expression.split(":", 2)
+                explode_specs.append(
+                    {
+                        "name": output_variable.name,
+                        "explode_type": explode_type,
+                        "scope": scope,
+                        "path": path,
+                    }
+                )
+
+        return explode_specs
+
+
+    def _get_cast_sql_types(self) -> set:
+        """
+        SQL cast types declared by non-internal output variables.
+        Used by log_failures() to log cast failures by SQL type.
+        """
+        sql_types = set()
+
+        for output_variable in self._transform_config.output_datasets[0].variables:
+            if getattr(output_variable, "internal", False):
+                continue
+
+            if output_variable.type in _TRY_CAST_TYPES:
+                sql_types.add(_TRY_CAST_TYPES[output_variable.type])
+
+        return sql_types
+
+
+    def _empty_failures_df(self) -> DataFrame:
+        """
+        Empty PIA-safe failures DataFrame.
+        """
+        return self.spark.createDataFrame(
+            [],
+            """
+            collectionInstance string,
+            responseId string,
+            caseId string,
+            variable_name string,
+            failure_type string,
+            message string
+            """,
+        )
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Parsing
+    # ──────────────────────────────────────────────────────────────────
+
+    # Main transformation
+    def transform(self, data):
+        """
+        Parse the input batch and return both the projected output and
+        the failure observations.
+
+        Pipeline:
+            1. Parse JSON-typed input columns into map<string,string>.
+            2. Apply each YAML-declared explode (outer variant).
+            3. Record one failure row per detected issue:
+                 * json_parse        — raw JSON did not parse
+                 * explode_parse     — array JSON did not parse
+                 * cast_<sql_type>   — try_cast returned NULL on non-blank input
+            4. Exclude any input row whose primary key appears in the
+               failure set, then project the configured output columns.
+
+        Args:
+            data: Dict of input DataFrames keyed by the YAML `key`
+                (e.g. {"responses": <input DataFrame>}).
+            pk_column: Name of the input column to use as the primary
+                key for failure records (e.g. "responseId" for
+                individual, "uoi" for household).
+
+        Returns:
+            (success_df, failures_df):
+                success_df: DataFrame in target-table shape, only rows
+                    that passed every check.
+                failures_df: DataFrame[response_id, variable_name,
+                    observed, failure_type], one row per failure
+                    observation, deduplicated on (response_id,
+                    variable_name, observed).
+
+        Note:
+            Returns a tuple, not a single DataFrame. Callers should
+            drive read → transform → log_failures → write explicitly
+            from the notebook
+        """
+        responses_df = data["responses"]
+
+        for source_id_column in SOURCE_ID_COLUMNS:
+            if source_id_column not in responses_df.columns:
+                raise ValueError(
+                    f"Required source identity column {source_id_column!r} "
+                    f"not found in input DataFrame."
+                )
+
+        # 1. Parse JSON input columns
+        json_input_columns = self._get_json_input_columns()
+
+        parsed_df = responses_df
+
+        for json_column_name in json_input_columns:
+            parsed_df = parsed_df.withColumn(
+                f"{json_column_name}_json",
+                from_json(
+                    col(json_column_name).cast("string"),
+                    MapType(StringType(), StringType()),
+                ),
+            )
+
+        json_scopes = set(json_input_columns)
+
+        failure_dataframes = []
+
+        # 2. JSON parse failures — raw column non-blank but parsed result NULL
+        for json_column_name in sorted(json_input_columns):
+            failure_dataframes.append(
+                parsed_df.filter( self._nonblank(col(json_column_name)) & col(f"{json_column_name}_json").isNull() )
+                .select(
+                    *self._failure_columns(
+                        variable_name=json_column_name,
+                        failure_type="json_parse",
+                        message=(f"JSON parsing failed for input field '{json_column_name}'."
+                        ),
+                    )
+                )
+            )
+
+
+
+        # 3. Apply explode(s) and capture explode parse failures
+        exploded_df = parsed_df
+
+        for explode_spec in self._get_explode_specs():
+            name = explode_spec["name"]
+            explode_type = explode_spec["explode_type"]
+            scope = explode_spec["scope"]
+            path = explode_spec["path"]
+
+            raw_array_expr = col(f"{scope}_json").getItem(path).cast("string")
+
+            array_expr = from_json(
+                raw_array_expr,
+                ArrayType(MapType(StringType(), StringType())),
+            )
+
+            # Failure if explode source is missing/blank OR cannot parse as expected array.
+            explode_failure_condition = (
+                ~self._nonblank(raw_array_expr)
+                | (self._nonblank(raw_array_expr) & array_expr.isNull())
+                | (size(array_expr) == 0)
+            )
+
+            failure_dataframes.append(
+                exploded_df
+                .filter(explode_failure_condition)
+                .select(
+                    *self._failure_columns(
+                        variable_name=f"{scope}:{path}",
+                        failure_type="explode_parse",
+                        message=(
+                            f"Explode input '{scope}:{path}' is missing, blank, empty"
+                            f"or could not be parsed as array<map<string,string>>."
+                        ),
+                    )
+                )
+            )
+
+            # Use normal explode/posexplode.
+            # Invalid source rows have already been captured in failure_dataframes.
+            if explode_type == "posexplode":
+                exploded_df = exploded_df.select(
+                    "*",
+                    posexplode(array_expr).alias(f"{name}_index", name),
+                )
+            else:
+                exploded_df = exploded_df.withColumn(
+                    name,
+                    explode(array_expr),
+                )
+
+            # Register exploded value as a new JSON scope
+            exploded_df = exploded_df.withColumn(f"{name}_json", col(name))
+            json_scopes.add(name)
+
+        output_vars = self._transform_config.output_datasets[0].variables
+
+
+
+        # 4. Cast failures — try_cast returns NULL on non-blank input
+        for output_variable in output_vars:
+            if getattr(output_variable, "internal", False):
+                continue
+
+            if output_variable.type not in _TRY_CAST_TYPES:
+                continue
+
+            expression = getattr(output_variable, "expression", None)
+            if not expression:
+                continue
+
+            # Explode driver variables are handled above
+            if expression.startswith(("explode:", "posexplode:")):
+                continue
+
+            base_expr = self._rewrite_json_expression(expression, json_scopes)
+            sql_type = _TRY_CAST_TYPES[output_variable.type]
+
+            raw_value_expr = expr(base_expr).cast("string")
+            casted_value_expr = expr(
+                f"try_cast(nullif(replace(trim(cast(({base_expr}) as string)), ',', ''), '') as {sql_type})"
+            )
+
+            failure_dataframes.append(
+                exploded_df
+                .select(
+                    "collectionInstance",
+                    "responseId",
+                    "caseId",
+                    raw_value_expr.alias("_raw_value"),
+                    casted_value_expr.alias("_casted_value"),
+                )
+                .filter(
+                    self._nonblank(col("_raw_value"))
+                    & col("_casted_value").isNull()
+                )
+                .select(
+                    *self._failure_columns(
+                        variable_name=output_variable.name,
+                        failure_type=f"cast_{sql_type}",
+                        message=(
+                            f"Type cast failed for variable "
+                            f"'{output_variable.name}'. Expected {sql_type}."
+                        ),
+                    )
+                )
+            )
+
+
+        # 5. Combine and deduplicate failures (suppresses duplicates after explode)
+        if failure_dataframes:
+            failures_df = (
+                reduce( lambda left_df, right_df: left_df.unionByName(right_df), failure_dataframes )
+                .dropDuplicates( ["collectionInstance", "responseId", "caseId", "variable_name", "failure_type"] )
+            )
+        else:
+            failures_df = self._empty_failures_df()
+
+
+        # 6. Exclude source records that had parsing failures.
+        failed_keys_df = failures_df.select(
+            "collectionInstance",
+            "responseId",
+            "caseId",
+        ).distinct()
+
+        # Use null-safe equality so failed records are excluded even if
+        # a key component is null.
+        join_condition = (
+            exploded_df["collectionInstance"].eqNullSafe(failed_keys_df["collectionInstance"])
+            & exploded_df["responseId"].eqNullSafe(failed_keys_df["responseId"])
+            & exploded_df["caseId"].eqNullSafe(failed_keys_df["caseId"])
+        )
+
+        clean_df = exploded_df.join(
+            failed_keys_df,
+            join_condition,
+            "left_anti",
+        )
+
+
+        # 7. Build final output columns
+        # Internal columns are used only for intermediate processing.
+        output_columns = [
+            col_expr
+            for output_variable in output_vars
+            if not getattr(output_variable, "internal", False)
+            if (col_expr := self._build_column(output_variable, json_scopes)) is not None
+        ]
+
+        success_df = clean_df.select(*output_columns)
+
+        return success_df, failures_df
+
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Public — logging
+    # ──────────────────────────────────────────────────────────────────
+
+    def log_failures(self, logger, failures_df: DataFrame, *, event_type: str = "PARSING") -> None:
+        """
+        Log parsing failures to the exceptions table via ExceptionLogger.
+        """
+
+        for failure_type in ("json_parse", "explode_parse"):
+            failure_subset = (
+                failures_df
+                .filter(col("failure_type") == failure_type)
+                .select(
+                    "collectionInstance",
+                    "responseId",
+                    "caseId",
+                    "variable_name",
+                    "message",
+                )
+            )
+
+            logger.log_dataframe(
+                failure_subset,
+                rule=failure_type,
+                event_type=event_type,
+                variable_name_column="variable_name",
+                response_id_column="responseId",
+                case_id_column="caseId",
+                collection_instance_id_column="collectionInstance",
+                message_column="message",
+            )
+
+        # Cast failures use one registry rule: "cast"
+        cast_failures_df = (
+            failures_df
+            .filter(col("failure_type").startswith("cast_"))
+            .select(
+                "collectionInstance",
+                "responseId",
+                "caseId",
+                "variable_name",
+                "message",
+            )
+        )
+
+        logger.log_dataframe(
+            cast_failures_df,
+            rule="cast",
+            event_type=event_type,
+            variable_name_column="variable_name",
+            response_id_column="responseId",
+            case_id_column="caseId",
+            collection_instance_id_column="collectionInstance",
+            message_column="message",
+        )
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Public — output PK inference
+    # ──────────────────────────────────────────────────────────────────
+
+    def infer_output_pk_columns(self) -> dict:
+        """
+        Infer output columns that map from the source record identity columns.
+        """
+        source_to_output_column = {}
+
+        for output_variable in self._transform_config.output_datasets[0].variables:
+            if getattr(output_variable, "internal", False):
+                continue
+
+            expression = getattr(output_variable, "expression", None)
+
+            if expression in SOURCE_ID_COLUMNS:
+                source_to_output_column[expression] = output_variable.name
+
+        missing_source_columns = [
+            source_column
+            for source_column in SOURCE_ID_COLUMNS
+            if source_column not in source_to_output_column
+        ]
+
+        if missing_source_columns:
+            raise ValueError(
+                "Could not infer output primary key mapping for source column(s): "
+                f"{missing_source_columns}. "
+                "Each source identity column must have a non-internal output variable "
+                "with expression equal to the source column name."
+            )
+
+        return source_to_output_column
+
+
+
+SPH_Survey_Data_Sourcing/src/transformations/parsing_orchestrator.py
+
+# parsing_runner.py
+
+"""
+Common orchestration for ESS0 → ESS1 parsing jobs.
+
+This module keeps parsing notebooks thin and consistent across forms.
+
+Responsibilities:
+    * Instantiate the Parsing transformation.
+    * Check target table existence.
+    * Read source data.
+    * Run Parsing.transform() to produce success and failure DataFrames.
+    * Log row-level parsing failures.
+    * Verify no-silent-loss coverage.
+    * Check target schema for blocking mismatches.
+    * Write successfully parsed rows.
+    * Log unhandled processing errors.
+
+Notes:
+    * Row-level parsing failures are PIA-safe.
+    * Raw observed values are not logged.
+    * Schema nullability mismatches are intentionally ignored at parsing stage.
+"""
+
+from __future__ import annotations
+
+import traceback
+from typing import Dict, Optional
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+
+from transformations.parsing import Parsing
+from transformations.schema_operations import (
+    build_schema,
+    get_schema_mismatches,
+    table_exists,
+)
+from utils.logger import ExceptionLogger
+
+
+SOURCE_ID_COLUMNS = ["collectionInstance", "responseId", "caseId"]
+
+BLOCKING_SCHEMA_MISMATCH_TYPES = {
+    "missing_in_actual",
+    "data_type_mismatch",
+}
+
+
+def select_normalised_identity_keys(
+    dataframe: DataFrame,
+    column_mapping: Optional[Dict[str, str]] = None,
+) -> DataFrame:
+    """
+    Return a comparable source-identity key DataFrame.
+
+    Output columns are always:
+        collectionInstance, responseId, caseId
+
+    Args:
+        dataframe:
+            DataFrame containing identity columns.
+        column_mapping:
+            Optional mapping from canonical source identity names to the
+            actual column names in `dataframe`.
+
+            Example for individual success_df:
+                {
+                    "collectionInstance": "collection_instance",
+                    "responseId": "person_nbr",
+                    "caseId": "i_id",
+                }
+
+    Why this exists:
+        Input, output, and failure DataFrames may use different column names
+        for the same source identity values. This function normalises those
+        names so the no-silent-loss coverage check can compare them.
+
+    Null handling:
+        Nulls are converted to a sentinel only for coverage comparison.
+        This avoids Spark's normal NULL != NULL join behaviour.
+    """
+    mapping = column_mapping or {
+        "collectionInstance": "collectionInstance",
+        "responseId": "responseId",
+        "caseId": "caseId",
+    }
+
+    return dataframe.select(
+        F.coalesce(
+            F.col(mapping["collectionInstance"]).cast("string"),
+            F.lit("__NULL__"),
+        ).alias("collectionInstance"),
+        F.coalesce(
+            F.col(mapping["responseId"]).cast("string"),
+            F.lit("__NULL__"),
+        ).alias("responseId"),
+        F.coalesce(
+            F.col(mapping["caseId"]).cast("string"),
+            F.lit("__NULL__"),
+        ).alias("caseId"),
+    ).distinct()
+
+
+def assert_required_source_identity_columns(source_dataframe: DataFrame) -> None:
+    """
+    Fail fast if any required source identity columns are missing from input.
+    """
+    missing_columns = [
+        source_id_column
+        for source_id_column in SOURCE_ID_COLUMNS
+        if source_id_column not in source_dataframe.columns
+    ]
+
+    if missing_columns:
+        raise RuntimeError(
+            "Required source identity column(s) missing from input DataFrame: "
+            f"{missing_columns}."
+        )
+
+
+def assert_no_silent_loss(
+    *,
+    source_dataframe: DataFrame,
+    success_dataframe: DataFrame,
+    failures_dataframe: DataFrame,
+    flow: Parsing,
+) -> None:
+    """
+    Assert every input source record is represented either in:
+        * success_dataframe, or
+        * failures_dataframe
+
+    This prevents silent row loss during parsing.
+
+    The check uses source identity:
+        collectionInstance + responseId + caseId
+
+    Output key columns are inferred from YAML by looking for output variables
+    whose expression maps from:
+        collectionInstance, responseId, caseId
+    """
+    output_identity_columns = flow.infer_output_pk_columns()
+
+    input_keys = select_normalised_identity_keys(source_dataframe)
+
+    output_keys = select_normalised_identity_keys(
+        success_dataframe,
+        column_mapping={
+            "collectionInstance": output_identity_columns["collectionInstance"],
+            "responseId": output_identity_columns["responseId"],
+            "caseId": output_identity_columns["caseId"],
+        },
+    )
+
+    failure_keys = select_normalised_identity_keys(failures_dataframe)
+
+    covered_keys = output_keys.unionByName(failure_keys).distinct()
+
+    missing_keys = input_keys.join(
+        covered_keys,
+        SOURCE_ID_COLUMNS,
+        "left_anti",
+    )
+
+    missing_count = missing_keys.count()
+
+    if missing_count > 0:
+        raise RuntimeError(
+            f"Coverage invariant violated: {missing_count} input record(s) "
+            "are neither in the success output nor in the failure set."
+        )
+
+
+def get_blocking_schema_mismatches(
+    *,
+    spark: SparkSession,
+    table_path: str,
+    output_variables,
+) -> list[dict]:
+    """
+    Return schema mismatches that block writing at parsing stage.
+
+    Parsing stage blocks on:
+        * missing_in_actual
+        * data_type_mismatch
+
+    Parsing stage ignores:
+        * nullability_mismatch
+
+    Nullability validation is handled later during data contract validation.
+    """
+    expected_schema = build_schema(output_variables)
+    actual_schema = spark.table(table_path).schema
+
+    schema_mismatches = get_schema_mismatches(
+        actual=actual_schema,
+        expected=expected_schema,
+    )
+
+    return [
+        mismatch
+        for mismatch in schema_mismatches
+        if mismatch["mismatch_type"] in BLOCKING_SCHEMA_MISMATCH_TYPES
+    ]
+
+
+def log_schema_mismatches(
+    *,
+    logger: ExceptionLogger,
+    mismatches: list[dict],
+    target_table: str,
+) -> None:
+    """
+    Log blocking schema mismatches.
+
+    expected/observed columns are not written to the exceptions table.
+    The expected/actual schema details are included only in the PIA-safe
+    message text.
+    """
+    for mismatch in mismatches:
+        logger.log(
+            rule="schema_mismatch",
+            event_type="PARSING",
+            variable_name=mismatch["column"],
+            message=(
+                f"Target table schema {mismatch['mismatch_type']} "
+                f"for column '{mismatch['column']}'. "
+                f"Expected={mismatch['expected']!r}, "
+                f"Actual={mismatch['actual']!r}. "
+                f"Target table={target_table}."
+            ),
+        )
+
+
+def log_missing_target_table(
+    *,
+    spark: SparkSession,
+    source_table: Optional[str],
+    target_table: str,
+) -> None:
+    """
+    Log missing target table as a file-level parsing exception.
+    """
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id=None,
+        source_table=source_table,
+        target_table=target_table,
+    ) as logger:
+        logger.log(
+            rule="file_not_found",
+            event_type="PARSING",
+            message=(
+                f"Target table does not exist: {target_table}. "
+                "Create it via the upstream DDL job before running parsing."
+            ),
+        )
+
+
+def log_processing_error(
+    *,
+    spark: SparkSession,
+    source_table: Optional[str],
+    target_table: Optional[str],
+    stack_trace: str,
+) -> None:
+    """
+    Log unhandled parsing job error.
+    """
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id=None,
+        source_table=source_table,
+        target_table=target_table,
+    ) as logger:
+        logger.log(
+            rule="processing_error",
+            event_type="PARSING",
+            message="Unhandled exception during parsing job execution.",
+            stack_trace=stack_trace,
+        )
+
+
+def run_parsing_job(
+    *,
+    spark: SparkSession,
+    config_file: str,
+) -> None:
+    """
+    Execute one ESS0 → ESS1 parsing job.
+
+    This function is intended to be called by thin Databricks notebooks.
+
+    Example:
+        run_parsing_job(
+            spark=spark,
+            config_file="individual/individual_parsing",
+        )
+
+    Args:
+        spark:
+            Active SparkSession.
+        config_file:
+            Transformation YAML path relative to the collection folder,
+            e.g.:
+                "individual/individual_parsing"
+                "dwelling/dwelling_parsing"
+                "household/household_parsing"
+                "household/dwelling_person_parsing"
+    """
+    flow = Parsing(spark, config_file)
+
+    input_dataset = flow._transform_config.input_datasets[0]
+    output_dataset = flow._transform_config.output_datasets[0]
+    output_variables = output_dataset.variables
+
+    known_failure_logged = False
+
+    try:
+        # ------------------------------------------------------------------
+        # 1. Ensure target table exists.
+        # ------------------------------------------------------------------
+        if not table_exists(spark, output_dataset.path):
+            log_missing_target_table(
+                spark=spark,
+                source_table=input_dataset.path,
+                target_table=output_dataset.path,
+            )
+
+            known_failure_logged = True
+            raise RuntimeError(
+                f"Target table {output_dataset.path} does not exist."
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Read source data.
+        # ------------------------------------------------------------------
+        data = flow.read()
+
+        if "responses" not in data:
+            raise RuntimeError(
+                f"Expected input dataset key 'responses'. "
+                f"Found keys={list(data.keys())}."
+            )
+
+        responses_dataframe = data["responses"]
+
+        assert_required_source_identity_columns(responses_dataframe)
+
+        # ------------------------------------------------------------------
+        # 3. Transform.
+        # ------------------------------------------------------------------
+        success_dataframe, failures_dataframe = flow.transform(data)
+
+        with ExceptionLogger.for_task(
+            spark=spark,
+            collection_instance_id=None,
+            source_table=input_dataset.path,
+            target_table=output_dataset.path,
+        ) as logger:
+
+            # --------------------------------------------------------------
+            # 4. Log row-level parsing failures.
+            # --------------------------------------------------------------
+            flow.log_failures(logger, failures_dataframe)
+
+            # --------------------------------------------------------------
+            # 5. No-silent-loss coverage check.
+            # --------------------------------------------------------------
+            assert_no_silent_loss(
+                source_dataframe=responses_dataframe,
+                success_dataframe=success_dataframe,
+                failures_dataframe=failures_dataframe,
+                flow=flow,
+            )
+
+            # --------------------------------------------------------------
+            # 6. Schema mismatch check.
+            # --------------------------------------------------------------
+            blocking_schema_mismatches = get_blocking_schema_mismatches(
+                spark=spark,
+                table_path=output_dataset.path,
+                output_variables=output_variables,
+            )
+
+            if blocking_schema_mismatches:
+                log_schema_mismatches(
+                    logger=logger,
+                    mismatches=blocking_schema_mismatches,
+                    target_table=output_dataset.path,
+                )
+
+                known_failure_logged = True
+                raise RuntimeError(
+                    f"Schema mismatch in {output_dataset.path}: "
+                    f"{len(blocking_schema_mismatches)} blocking mismatch(es)."
+                )
+
+            # --------------------------------------------------------------
+            # 7. Write successfully parsed rows.
+            # --------------------------------------------------------------
+            flow.write(success_dataframe)
+
+    except Exception:
+        if not known_failure_logged:
+            log_processing_error(
+                spark=spark,
+                source_table=input_dataset.path if "input_dataset" in locals() else None,
+                target_table=output_dataset.path if "output_dataset" in locals() else None,
+                stack_trace=traceback.format_exc(),
+            )
+
+        raise
+
+
+
+
+SPH_Survey_Data_Sourcing/src/transformations/abstract_transformation.py
+
+
+from abc import ABC, abstractmethod
+from pyspark.sql.functions import col, DataFrame
+from config_models.collection_config import Collection
+from config_models.transformation_config import TransformationConfig
+from transformations.settings import get_target_widget, get_collection_widget
+from transformations.table_writer import write_table
+from utils.logger.event_logger import EventLogger
+
+
+class AbstractTransformation(ABC):
+    def __init__(
+        self,
+        spark,
+        config_file: str,
+        target=None,
+        collection: Collection | None = None,
+        event_logger: None | EventLogger = None,
+    ):
+        """
+        Base class for transformations.
+        Args:
+            spark (_type_): _spark instance_
+            config_file (str): _Path to transformation config file e.g. "individual/aria_classify/ethnicity"_
+            target (_type_, optional): _Target environment e.g. "uat"_. Defaults to None.
+            collection (Collection enum value, optional): _the collection e.g. Collection.social_census_. Default reads collection notebook widget.
+            event_logger (EventLogger, optional): For tests to inject mock logger. Will be removed if events are recorded as paradata
+        """
+        self.spark = spark
+        self.target = target or get_target_widget()
+        self.collection = collection or get_collection_widget()
+        self.event_logger = event_logger
+
+        self._transform_config = TransformationConfig(
+            collection=self.collection, environment=self.target, transformation=config_file
+        )
+
+    def read(self) -> dict[str, DataFrame]:
+        """_summary_
+        Reads source tables into dict which it returns
+        Returns:
+            dict: The dictionary with source tables
+        """
+        data = dict()
+        for source in self._transform_config.input_datasets:
+            df = self.spark.table(source.path)
+            if not source.include_all_variables:
+                cols = [col(v.alias).alias(v.name) for v in source.variables]
+                df = df.select(*cols)
+            data[source.key] = df
+        return data
+
+    @abstractmethod
+    def transform(self, data: dict[str, DataFrame]) -> DataFrame:
+        """Apply business transformations"""
+        pass
+
+    def write(self, df: DataFrame) -> None:
+        for output_dataset in self._transform_config.output_datasets:
+            write_table(
+                df=df,
+                output_dataset=output_dataset,
+                spark=self.spark,
+            )
+
+    def run(self) -> None:
+        df = self.read()
+        df_result = self.transform(df)
+        self.write(df_result)
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/transformations/settings.py
+
+
+from databricks.sdk.runtime import dbutils
+
+from config_models.collection_config import Collection
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def get_target_widget(name: str = "target") -> str:
+    dbutils.widgets.text(name, "dev")
+    return dbutils.widgets.get(name)
+
+
+def get_collection_widget() -> Collection:
+    dbutils.widgets.text("collection", str(Collection.social_census.value))
+    collection_text = dbutils.widgets.get("collection")
+    try:
+        c = Collection(collection_text)
+        logger.info(f"Using collection {c}")
+        print(f"Using collection {c}")
+        return c
+    except ValueError:
+        raise AttributeError(
+            f"Invalid collection: {collection_text}. Valid options are: {', '.join([c.name for c in Collection])}"
+        )
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/transformations/table_writer.py
+
+
+from delta.tables import DeltaTable
+from pyspark.sql import DataFrame, SparkSession
+from config_models.dataset_config import DatasetConfig
+from pyspark.sql.functions import (
+    col,
+    concat_ws,
+    current_timestamp,
+    lit,
+    max as spark_max,
+    row_number,
+    sha2,
+    to_utc_timestamp,
+)
+from pyspark.sql.window import Window
+
+from utils.incremental_filter import filter_by_watermark, get_new_and_changed_records
+
+_AUDIT_COLS = {
+    "pk", "pk_hash", "row_hash", "sys_create_date", "created_date",
+    "effective_from_date", "effective_to_date", "run_id", "insert_time_utc"
+}
+
+SCD_CURRENT_ROW_SENTINEL = "9999-12-31T23:59:59+13:00"
+
+
+def write_table(
+    df: DataFrame,
+    output_dataset: DatasetConfig,
+    spark: SparkSession,
+    merge_mode: bool = True,
+    run_id: str = None,
+):
+    """
+    Write DataFrame to Delta table with incremental SCD Type 2 UPSERT or full overwrite.
+    
+    Automatically adds audit columns (pk, pk_hash, row_hash, created_date, effective_from_date, 
+    effective_to_date, etc.) based on is_pk flags in the output_dataset variable definitions.
+
+    When merge_mode=True, incremental filtering and SCD Type 2 merge are applied:
+      0. Deduplication — keep only the latest record per primary key (by max sys_create_date)
+            1. _get_dynamic_watermark() — read MAX(insert_time_utc) from target table
+            2. filter_by_watermark() — time-based pre-filter using sys_create_date (fast)
+            3. _add_audit_columns()  — compute pk_hash and row_hash on parsed data
+            4. get_new_and_changed_records() — hash-based filter against current rows
+            5. _merge_into_table()   — SCD Type 2 UPSERT: close old rows, insert new versions
+
+    When merge_mode=False, overwrites the entire table.
+
+    Args:
+        df: DataFrame to write (post-parsing, pre-audit columns)
+        output_dataset: DatasetConfig containing variable definitions
+        spark: SparkSession
+        merge_mode: If True, perform incremental SCD Type 2 UPSERT; if False, full overwrite
+        run_id: Workflow run ID for lineage tracking
+    """
+    audit_ddl = [
+        "pk STRING",
+        "pk_hash STRING",
+        "row_hash STRING",
+        "created_date TIMESTAMP",
+        "effective_from_date TIMESTAMP",
+        "effective_to_date TIMESTAMP",
+        "run_id STRING",
+        "insert_time_utc TIMESTAMP",
+    ]
+    data_ddl = [f"{c.alias} {c.type.upper()}" for c in output_dataset.variables if not c.internal]
+    ddl_cols = ",\n".join(data_ddl + audit_ddl)
+    output_table = output_dataset.path
+    sql_query = f"""CREATE TABLE IF NOT EXISTS {output_table} ( {ddl_cols} ) USING DELTA"""
+
+    spark.sql(sql_query)
+    out_table_cols = [col(v.name).alias(v.alias) for v in output_dataset.variables if not v.internal]
+    df = df.select(*out_table_cols)
+
+    # Deduplicate: keep only the latest record per primary key (by max sys_create_date)
+    pk_cols = [v.alias for v in output_dataset.variables if not v.internal and v.is_pk]
+    if pk_cols and "sys_create_date" in df.columns:
+        window_spec = Window.partitionBy(*pk_cols).orderBy(col("sys_create_date").desc())
+        df = df.withColumn("_rn", row_number().over(window_spec)).filter(col("_rn") == 1).drop("_rn")
+    
+    if merge_mode:
+        # Step 1: Dynamically calculate watermark from target table state
+        watermark = _get_dynamic_watermark(spark, output_table)
+
+        # Step 2: Time-based pre-filter using watermark (fast)
+        df = filter_by_watermark(df, watermark)
+
+        # Step 3: Add audit columns (computes pk_hash and row_hash)
+        df = _add_audit_columns(df, output_dataset, run_id, spark)
+
+        # Step 4: Hash-based filter — only new or changed records
+        df = get_new_and_changed_records(df, output_table, spark)
+
+        # Step 5: UPSERT into Delta table
+        merged_record_count = df.count()
+        if merged_record_count > 0:
+            _merge_into_table(df, output_table, spark)
+    else:
+        df = _add_audit_columns(df, output_dataset, run_id, spark)
+        df.write.mode("overwrite").option("overwriteSchema", "false").saveAsTable(output_table)
+
+def _get_dynamic_watermark(spark: SparkSession, target_table: str):
+    """
+    Calculate watermark dynamically from target table state.
+
+    Returns MAX(insert_time_utc) from the target table, or None when empty.
+    """
+    result = spark.table(target_table).agg(spark_max(col("insert_time_utc")).alias("watermark")).collect()
+    if result and result[0][0]:
+        return result[0][0]
+    return None
+
+
+def _add_audit_columns(
+    df: DataFrame,
+    output_dataset: DatasetConfig,
+    run_id: str,
+    spark: SparkSession,
+) -> DataFrame:
+    """
+    Append audit columns to a DataFrame based on variable config.
+
+    pk       : pipe-delimited composite of all is_pk=true columns
+    pk_hash  : SHA-256 of pk
+    row_hash : SHA-256 of all non-pk, non-audit, non-internal data columns
+    created_date / effective_from_date : current UTC timestamp
+    effective_to_date : default sentinel value 9999-12-31T23:59:59+13:00 (timestamp)
+    run_id   : workflow run identifier
+    """
+    tz = spark.conf.get("spark.sql.session.timeZone")
+    now = to_utc_timestamp(current_timestamp(), tz)
+
+    pk_cols = [v.alias for v in output_dataset.variables if not v.internal and v.is_pk]
+    data_cols = [
+        v.alias for v in output_dataset.variables
+        if not v.internal and not v.is_pk and v.alias not in _AUDIT_COLS
+    ]
+
+    if not pk_cols:
+        # Some outputs (for example classification/reference-style datasets used in unit
+        # tests) may not define business keys. Fall back to hashing all data columns so
+        # audit columns can still be populated and writes do not fail. 
+        fallback_cols = [
+            v.alias for v in output_dataset.variables
+            if not v.internal and v.alias not in _AUDIT_COLS
+        ]
+        if not fallback_cols:
+            raise ValueError(
+                f"Output dataset '{output_dataset.dataset}' has no usable non-internal columns "
+                "to derive audit hashes."
+            )
+        pk_cols = fallback_cols
+        data_cols = fallback_cols
+
+    return (
+        df
+        .withColumn("pk", concat_ws("|", *[col(c) for c in pk_cols]))
+        .withColumn("pk_hash", sha2(col("pk"), 256))
+        .withColumn("row_hash", sha2(concat_ws("|", *[col(c) for c in data_cols]), 256))
+        .withColumn("created_date", now)
+        .withColumn("effective_from_date", now)
+        .withColumn("effective_to_date", lit(SCD_CURRENT_ROW_SENTINEL).cast("timestamp"))
+        .withColumn("run_id", lit(run_id))
+        .withColumn("insert_time_utc", now)
+    )
+
+
+def _merge_into_table(df: DataFrame, target_table: str, spark: SparkSession):
+    """
+    Perform SCD Type 2 merge on target table using pk_hash as the key.
+    
+    Implements Slowly Changing Dimension Type 2 logic:
+    - MATCHED (current row) with row_hash changed: Close old row (effective_to_date = now), insert new version
+    - MATCHED (current row) but row_hash unchanged: no action (skip)
+    - NOT MATCHED: Insert new row
+    
+    The join condition matches only "current" records (effective_to_date = 9999-12-31T23:59:59+13:00).
+    After closing an old row, the new version (from source) no longer matches the join condition,
+    so it gets inserted via the WHEN NOT MATCHED clause.
+    
+    Args:
+        df: DataFrame with new/updated records (must include audit columns: pk_hash, row_hash, 
+                                               effective_from_date, effective_to_date)
+        target_table: Target Delta table name
+        spark: SparkSession
+    """
+    delta_table = DeltaTable.forName(spark, target_table)
+    
+    # Ensure required columns exist
+    if "pk_hash" not in df.columns or "row_hash" not in df.columns:
+        raise ValueError("DataFrame must contain 'pk_hash' and 'row_hash' columns for MERGE operation")
+    
+    tz = spark.conf.get("spark.sql.session.timeZone")
+    now = to_utc_timestamp(current_timestamp(), tz)
+    
+    # Merge logic: match on pk_hash AND current row filter (effective_to_date = 9999-12-31)
+    delta_table.alias("t").merge(
+        df.alias("s"),
+        (
+            "t.pk_hash = s.pk_hash AND "
+            f"cast(t.effective_to_date as timestamp) = cast('{SCD_CURRENT_ROW_SENTINEL}' as timestamp)"
+        )
+    ).whenMatchedUpdate(
+        condition="t.row_hash != s.row_hash",
+        set={"effective_to_date": now}
+    ).whenNotMatchedInsert(
+        values={col_name: col(f"s.{col_name}") for col_name in df.columns}
+    ).execute()
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/compare_tables.py
+"""
+Table comparison utilities for Databricks.
+
+Provides functions to compare two Delta tables:
+- Schema / column differences
+- Data type differences on common columns
+- PK-based row comparison showing column-level diffs (new_value | old_value)
+"""
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+
+
+def compare_schemas(df_a: DataFrame, df_b: DataFrame, name_a: str, name_b: str) -> dict:
+    """
+    Compare the schemas of two DataFrames.
+
+    Returns a dict with:
+        only_in_a   : columns present in A but not B
+        only_in_b   : columns present in B but not A
+        common_cols : sorted list of columns present in both
+        type_diffs  : dict of column -> (type_in_a, type_in_b) for mismatched types
+    """
+    cols_a = set(df_a.columns)
+    cols_b = set(df_b.columns)
+    common_cols = sorted(cols_a & cols_b)
+
+    schema_a = {f.name: f.dataType.simpleString() for f in df_a.schema if f.name in common_cols}
+    schema_b = {f.name: f.dataType.simpleString() for f in df_b.schema if f.name in common_cols}
+
+    type_diffs = {
+        c: (schema_a[c], schema_b[c])
+        for c in common_cols
+        if schema_a[c] != schema_b[c]
+    }
+
+    result = {
+        "only_in_a": sorted(cols_a - cols_b),
+        "only_in_b": sorted(cols_b - cols_a),
+        "common_cols": common_cols,
+        "type_diffs": type_diffs,
+    }
+
+    print("=" * 60)
+    print("SCHEMA COMPARISON")
+    print("=" * 60)
+    print(f"Columns only in {name_a} ({len(result['only_in_a'])}): {result['only_in_a'] or 'none'}")
+    print(f"Columns only in {name_b} ({len(result['only_in_b'])}): {result['only_in_b'] or 'none'}")
+    print(f"Common columns ({len(common_cols)}): {common_cols}")
+
+    if type_diffs:
+        print("\nTYPE DIFFERENCES ON COMMON COLUMNS:")
+        for col_name, (type_a, type_b) in type_diffs.items():
+            print(f"  {col_name}: {name_a}={type_a}  |  {name_b}={type_b}")
+    else:
+        print("\nNo type differences on common columns.")
+
+    return result
+
+
+def compare_rows(
+    df_a: DataFrame,
+    df_b: DataFrame,
+    name_a: str,
+    name_b: str,
+    pk_cols: list,
+    compare_cols: list = None,
+) -> DataFrame:
+    """
+    Join two DataFrames on pk_cols and compare column values side-by-side.
+
+    Each non-PK column in the result shows:
+      - 'MATCH'               if values are equal (including both NULL)
+      - 'new_value | old_value' if values differ
+
+    Only rows with at least one difference are returned.
+
+    Args:
+        df_a:         DataFrame A (the "new" table)
+        df_b:         DataFrame B (the "old" table)
+        name_a:       Label for table A
+        name_b:       Label for table B
+        pk_cols:      Columns to join on (must exist in both tables)
+        compare_cols: Columns to compare. Defaults to all common non-PK columns.
+
+    Returns:
+        DataFrame with PK columns + one diff column per compared column.
+        Only rows with at least one difference are included.
+    """
+    all_common = set(df_a.columns) & set(df_b.columns)
+    pk_cols = [c for c in pk_cols if c in all_common]
+    if not pk_cols:
+        raise ValueError(f"None of the specified pk_cols exist in both tables: {pk_cols}")
+
+    if compare_cols:
+        non_pk_cols = [c for c in compare_cols if c in all_common and c not in pk_cols]
+    else:
+        non_pk_cols = [c for c in sorted(all_common) if c not in pk_cols]
+
+    # Cast all columns to string for uniform comparison
+    a_cols = pk_cols + non_pk_cols
+    df_a_str = df_a.select(*[F.col(c).cast("string").alias(c) for c in a_cols])
+    df_b_str = df_b.select(*[F.col(c).cast("string").alias(c) for c in a_cols])
+
+    # Prefix non-PK columns in B to avoid name clash after join
+    df_b_prefixed = df_b_str
+    for c in non_pk_cols:
+        df_b_prefixed = df_b_prefixed.withColumnRenamed(c, f"_b_{c}")
+
+    joined = df_a_str.join(df_b_prefixed, on=pk_cols, how="inner")
+
+    # Build MATCH / "a | b" diff column for each compared column
+    for c in non_pk_cols:
+        joined = joined.withColumn(
+            c,
+            F.when(
+                (F.col(c).eqNullSafe(F.col(f"_b_{c}"))),
+                F.lit("MATCH")
+            ).otherwise(
+                F.concat_ws(
+                    " | ",
+                    F.coalesce(F.col(c), F.lit("NULL")),
+                    F.coalesce(F.col(f"_b_{c}"), F.lit("NULL")),
+                )
+            )
+        ).drop(f"_b_{c}")
+
+    # Keep only rows where at least one column is not MATCH
+    diff_filter = " OR ".join([f"`{c}` != 'MATCH'" for c in non_pk_cols])
+    result = joined.filter(diff_filter) if diff_filter else joined
+
+    count_total = df_a_str.join(df_b_prefixed, on=pk_cols, how="inner").count()
+    count_diff = result.count()
+
+    # Drop columns where every row is MATCH (they add no value to the output)
+    if count_diff > 0 and non_pk_cols:
+        has_diff = result.agg(
+            *[F.max(F.when(F.col(c) != "MATCH", F.lit(1)).otherwise(F.lit(0))).alias(c) for c in non_pk_cols]
+        ).collect()[0].asDict()
+        diff_cols = [c for c in non_pk_cols if has_diff.get(c) == 1]
+    else:
+        diff_cols = []
+
+    result = result.select(*pk_cols, *diff_cols)
+
+    print("=" * 60)
+    print(f"ROW COMPARISON  ({name_a}  vs  {name_b})")
+    print("=" * 60)
+    print(f"Rows in {name_a}:         {df_a.count()}")
+    print(f"Rows in {name_b}:         {df_b.count()}")
+    print(f"Rows with matching PKs:   {count_total}")
+    print(f"Rows with differences:    {count_diff}")
+    print(f"PK columns:               {pk_cols}")
+    print(f"Compared columns:         {non_pk_cols}")
+    print(f"Columns with diffs:       {diff_cols}")
+    print(f"\nColumn format: new_value | old_value  (MATCH if identical)")
+
+    return result
+
+
+def compare_tables(
+    spark: SparkSession,
+    table_a: str,
+    table_b: str,
+    pk_cols: list,
+    compare_cols: list = None,
+) -> DataFrame:
+    """
+    Full comparison of two Delta tables: schema differences and PK-based row diffs.
+
+    Args:
+        spark:        SparkSession
+        table_a:      Fully qualified table name — the "new" table (catalog.schema.table)
+        table_b:      Fully qualified table name — the "old" table (catalog.schema.table)
+        pk_cols:      Columns that uniquely identify a row (used for joining)
+        compare_cols: Columns to compare values for. Defaults to all common non-PK columns.
+
+    Returns:
+        DataFrame of rows with at least one differing column value.
+        Each column shows 'MATCH' or 'new_value | old_value'.
+    """
+    df_a = spark.table(table_a)
+    df_b = spark.table(table_b)
+
+    compare_schemas(df_a, df_b, table_a, table_b)
+    return compare_rows(df_a, df_b, table_a, table_b, pk_cols, compare_cols)
+
+    """
+    Compare the schemas of two DataFrames.
+
+    Returns a dict with:
+        only_in_a   : columns present in A but not B
+        only_in_b   : columns present in B but not A
+        common_cols : sorted list of columns present in both
+        type_diffs  : dict of column -> (type_in_a, type_in_b) for mismatched types
+    """
+    cols_a = set(df_a.columns)
+    cols_b = set(df_b.columns)
+    common_cols = sorted(cols_a & cols_b)
+
+    schema_a = {f.name: f.dataType.simpleString() for f in df_a.schema if f.name in common_cols}
+    schema_b = {f.name: f.dataType.simpleString() for f in df_b.schema if f.name in common_cols}
+
+    type_diffs = {
+        c: (schema_a[c], schema_b[c])
+        for c in common_cols
+        if schema_a[c] != schema_b[c]
+    }
+
+    result = {
+        "only_in_a": sorted(cols_a - cols_b),
+        "only_in_b": sorted(cols_b - cols_a),
+        "common_cols": common_cols,
+        "type_diffs": type_diffs,
+    }
+
+    print("=" * 60)
+    print("SCHEMA COMPARISON")
+    print("=" * 60)
+    print(f"Columns only in {table_a} ({len(result['only_in_a'])}): {result['only_in_a'] or 'none'}")
+    print(f"Columns only in {table_b} ({len(result['only_in_b'])}): {result['only_in_b'] or 'none'}")
+    print(f"Common columns ({len(common_cols)}): {common_cols}")
+
+    if type_diffs:
+        print("\nTYPE DIFFERENCES ON COMMON COLUMNS:")
+        for col_name, (type_a, type_b) in type_diffs.items():
+            print(f"  {col_name}: {table_a}={type_a}  |  {table_b}={type_b}")
+    else:
+        print("\nNo type differences on common columns.")
+
+    return result
+
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/incremental_filter.py
+
+"""
+Incremental filtering utilities for SCD Type 2 (Slowly Changing Dimension Type 2) processing.
+
+This module provides efficient incremental processing using:
+1. Watermark-based filtering (time-based) for fast pre-filtering of source records
+2. Row hash comparison for detecting actual changes within the watermark window
+3. Current row filtering (effective_to_date = 9999-12-31 23:59:59) to compare only active rows
+
+This enables efficient incremental SCD Type 2 UPSERT operations where:
+- New records are inserted
+- Changed records close the old version (set effective_to_date) and insert a new version
+- Unchanged records are skipped
+"""
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import col, lit
+
+SCD_CURRENT_ROW_SENTINEL = "9999-12-31T23:59:59+13:00"
+
+
+def filter_by_watermark(
+    source_df: DataFrame,
+    watermark_timestamp,
+    watermark_col: str = "sys_create_date",
+) -> DataFrame:
+    """
+    Filter source_df to only records created/updated after the watermark timestamp.
+    
+    This is the first-pass filter for efficiency — only processes new records
+    since the last run.
+    
+    Args:
+        source_df: Source DataFrame to filter
+        watermark_timestamp: Timestamp to filter from (exclusive)
+        watermark_col: Name of timestamp column (default: "sys_create_date")
+    
+    Returns:
+        DataFrame containing only records after the watermark
+    """
+    if watermark_timestamp is None:
+        # First run — process all records
+        return source_df
+    
+    return source_df.filter(col(watermark_col) > watermark_timestamp)
+
+
+def get_new_and_changed_records(
+    source_df: DataFrame,
+    target_table: str,
+    spark: SparkSession,
+    pk_hash_col: str = "pk_hash",
+    row_hash_col: str = "row_hash",
+) -> DataFrame:
+    """
+    Filter source_df to only records that are new or have changed.
+    
+    Compares source records against the target table using pk_hash and row_hash.
+    Only compares against current rows (effective_to_date = 9999-12-31T23:59:59+13:00) per SCD Type 2.
+    
+    Logic:
+    - New records: pk_hash not found in current target rows
+    - Changed records: pk_hash exists in current rows but row_hash differs
+    
+    This is the second-pass filter (post-watermark) to detect actual changes.
+    
+    Args:
+        source_df: Source DataFrame to filter
+        target_table: Target Delta table name to compare against
+        spark: SparkSession
+        pk_hash_col: Name of primary key hash column (default: "pk_hash")
+        row_hash_col: Name of row hash column (default: "row_hash")
+    
+    Returns:
+        DataFrame containing only new and changed records from source_df
+    """
+    try:
+        existing = spark.table(target_table)
+        # Spark Connect can defer missing table/permission failures until action time.
+        # Trigger a tiny action eagerly so failures are handled by this try/except.
+        existing.limit(1).collect()
+        
+        # Filter to current rows only (SCD Type 2: canonical timestamp sentinel value)
+        existing = existing.filter(
+            col("effective_to_date").cast("timestamp")
+            == lit(SCD_CURRENT_ROW_SENTINEL).cast("timestamp")
+        )
+        
+        # Select pk_hash and row_hash from existing table
+        existing_keys = existing.select(
+            col(pk_hash_col).alias("existing_pk_hash"),
+            col(row_hash_col).alias("existing_row_hash")
+        ).distinct()
+        
+        # Left join to identify new and changed records
+        joined = source_df.join(
+            existing_keys,
+            source_df[pk_hash_col] == existing_keys["existing_pk_hash"],
+            how="left"
+        )
+        
+        # Filter to keep only new (no match) or changed (row_hash differs) records
+        result = joined.filter(
+            (col("existing_pk_hash").isNull()) |  # New record (no match in target)
+            (col(row_hash_col) != col("existing_row_hash"))  # Changed record
+        ).select(source_df.columns)
+        
+        return result
+        
+    except Exception as e:
+        # Table doesn't exist yet or other error - process all records
+        print(f"Warning: Could not filter against {target_table}: {e}")
+        print("Processing all records from source.")
+        return source_df
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/json_functions.py
+
+# utils/json_functions.py
+import os
+import yaml
+from pathlib import Path
+import json
+
+
+def load_config(file_name: str) -> dict:
+    ext = Path(file_name).suffix.lower()
+    with open(file_name, "r") as f:
+        if ext in {".yml", ".yaml"}:
+            return yaml.safe_load(f)
+        elif ext == ".json":
+            return json.load(f)
+        else:
+            raise ValueError(
+                f"Unsupported config file type '{ext}'. "
+                "Only .yml, .yaml, and .json are supported."
+            )
+
+
+def deepest_category_code_for_descriptor(items, descriptor):
+    descriptor_lower = descriptor.lower()
+    deepest = None
+    deepest_code = None
+
+    for item in items:
+        if item["descriptor"].lower() == descriptor_lower:
+            depth = item["levelDepth"]
+            if deepest is None or depth > deepest:
+                deepest = depth
+                deepest_code = item["code"]
+
+    return deepest_code
+
+
+def deepest_category_code_for_descriptors_dict(category_json, descriptors):
+    # Map lowercase → original descriptor
+    desc_map = {d.lower(): d for d in descriptors}
+
+    # Track best result per lowercase descriptor
+    results = {d.lower(): (None, None) for d in descriptors}
+
+    for item in category_json:
+        desc_lower = item["descriptor"].lower()
+
+        if desc_lower in results:
+            depth = item["levelDepth"]
+            code = item["code"]
+
+            current_depth, _ = results[desc_lower]
+            if current_depth is None or depth > current_depth:
+                results[desc_lower] = (depth, code)
+
+    # Convert back to original casing in output
+    return {desc_map[k]: code for k, (_, code) in results.items()}
+
+
+def deepest_category_code_for_descriptors_df(category_json, descriptors):
+    # Map lowercase → original descriptor
+    desc_map = {d.lower(): d for d in descriptors}
+
+    # Track best (deepest) result per lowercase descriptor
+    results = {d.lower(): {"levelDepth": None, "code": None} for d in descriptors}
+
+    for item in category_json:
+        desc_lower = item["descriptor"].lower()
+
+        if desc_lower in results:
+            depth = item["levelDepth"]
+            code = item["code"]
+
+            current_depth = results[desc_lower]["levelDepth"]
+            if current_depth is None or depth > current_depth:
+                results[desc_lower] = {"levelDepth": depth, "code": code}
+
+    # Build DataFrame with original descriptor casing
+    rows = [
+        {"descriptor": desc_map[desc_lower], "code": data["code"]}
+        for desc_lower, data in results.items()
+    ]
+
+    return pd.DataFrame(rows)
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/search_resources.py
+
+"""
+Search utilities for both filesystem and Databricks catalogs.
+
+Notebook usage - Search Files:
+    from utils.search_resources import search_files
+    search_files(search_str, root_dir=ROOT_DIR)
+    search_files(search_str, root_dir=ROOT_DIR, extensions=[".py", ".yml"])
+
+Notebook usage - Search Catalogs:
+    from utils.search_resources import search_catalogs
+    result = search_catalogs(search_str, catalogs="search_catalogs", spark=spark)
+    result  # displays matches
+    
+    # Generate DROP statements
+    drop_stmts = result.get_drop_statements("main")
+    for stmt in drop_stmts:
+        print(stmt)
+    
+    # Execute the statements
+    for stmt in drop_stmts:
+        spark.sql(stmt)
+"""
+import os
+import argparse
+from dataclasses import dataclass, field
+
+_SKIP_DIRS = {"__pycache__", ".venv", "node_modules"}
+
+
+@dataclass
+class SearchResult:
+    search_string: str
+    root_dir: str
+    folder_matches: list[str] = field(default_factory=list)
+    name_matches: list[str] = field(default_factory=list)
+    content_matches: list[str] = field(default_factory=list)
+
+    def __repr__(self) -> str:
+        lines = [
+            f"\nSearch string : '{self.search_string}'",
+            f"Root directory: {self.root_dir}\n",
+        ]
+        if self.folder_matches:
+            lines.append(f"--- Folders matching by NAME ({len(self.folder_matches)}) ---")
+            lines.extend(f"  {p}" for p in self.folder_matches)
+        else:
+            lines.append("--- No folders matched by name ---")
+
+        if self.name_matches:
+            lines.append(f"\n--- Files matching by NAME ({len(self.name_matches)}) ---")
+            lines.extend(f"  {p}" for p in self.name_matches)
+        else:
+            lines.append("\n--- No files matched by name ---")
+
+        if self.content_matches:
+            lines.append(f"\n--- Files matching by CONTENT ({len(self.content_matches)}) ---")
+            lines.extend(f"  {p}" for p in self.content_matches)
+        else:
+            lines.append("\n--- No files matched by content ---")
+
+        return "\n".join(lines)
+
+
+def search_files(
+    search_string: str,
+    root_dir: str,
+    extensions: list[str] | None = None,
+) -> SearchResult:
+    """
+    Search for folders, files whose name, or content that contains search_string.
+
+    Args:
+        search_string: The string to search for (case-insensitive).
+        root_dir:      Root directory to walk. Pass ROOT_DIR from definitions.py.
+        extensions:    Optional list of extensions to include, e.g. [".py", ".yml"].
+                       If None, all files are searched.
+
+    Returns:
+        SearchResult with folder_matches, name_matches, and content_matches lists.
+        Printing the result displays a formatted summary.
+    """
+    result = SearchResult(search_string=search_string, root_dir=root_dir)
+    needle = search_string.lower()
+
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # Check folder names
+        dirs_to_remove = []
+        for d in dirnames:
+            if d.startswith(".") or d in _SKIP_DIRS:
+                dirs_to_remove.append(d)
+            elif needle in d.lower():
+                rel_folder = os.path.relpath(os.path.join(dirpath, d), root_dir)
+                result.folder_matches.append(rel_folder)
+        
+        dirnames[:] = [d for d in dirnames if d not in dirs_to_remove]
+
+        for filename in filenames:
+            if extensions and not any(filename.endswith(ext) for ext in extensions):
+                continue
+
+            filepath = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(filepath, root_dir)
+
+            if needle in filename.lower():
+                result.name_matches.append(rel_path)
+                continue
+
+            try:
+                with open(filepath, encoding="utf-8", errors="ignore") as f:
+                    if needle in f.read().lower():
+                        result.content_matches.append(rel_path)
+            except (OSError, PermissionError):
+                pass
+
+    return result
+
+
+@dataclass
+class CatalogSearchResult:
+    search_string: str
+    catalogs: str
+    results: list[tuple[str, str]] = field(default_factory=list)  # (schema, table) tuples
+
+    def __repr__(self) -> str:
+        lines = [
+            f"\nSearch string : '{self.search_string}'",
+            f"Catalogs       : {self.catalogs}\n",
+        ]
+        if self.results:
+            lines.append(f"--- Matches found ({len(self.results)}) ---")
+            for schema, table in self.results:
+                if table:
+                    lines.append(f"  {schema}.{table}")
+                else:
+                    lines.append(f"  {schema} (schema)")
+        else:
+            lines.append("--- No matches found ---")
+
+        return "\n".join(lines)
+
+    def get_drop_statements(self, catalog: str) -> list[str]:
+        """Generate DROP SQL statements for matched schemas and tables."""
+        statements = []
+        for schema, table in self.results:
+            if table:
+                statements.append(f"DROP TABLE IF EXISTS {catalog}.{schema}.{table};")
+            else:
+                statements.append(f"DROP SCHEMA IF EXISTS {catalog}.{schema} CASCADE;")
+        return statements
+
+
+def search_catalogs(
+    search_string: str,
+    catalogs: str,
+    spark,
+) -> CatalogSearchResult:
+    """
+    Search for schemas and tables matching search_string in specified catalogs.
+
+    Args:
+        search_string: The string to search for (case-insensitive).
+        catalogs:      Comma-separated catalog names (e.g., "main,other").
+        spark:         SparkSession object.
+
+    Returns:
+        CatalogSearchResult with list of (schema, table) tuples.
+        Use .get_drop_statements(catalog_name) to generate DROP statements.
+    """
+    result = CatalogSearchResult(search_string=search_string, catalogs=catalogs)
+    needle = search_string.lower()
+    catalog_list = [c.strip() for c in catalogs.split(",")]
+
+    for catalog in catalog_list:
+        try:
+            spark.sql(f"USE CATALOG {catalog}")
+            schemas_df = spark.sql(f"SHOW SCHEMAS IN {catalog}").select("databaseName")
+            schemas = [row.databaseName for row in schemas_df.collect()]
+
+            for schema in schemas:
+                # Check if schema name matches
+                if needle in schema.lower():
+                    result.results.append((schema, ""))
+
+                # Get tables in schema
+                try:
+                    tables_df = spark.sql(f"SHOW TABLES IN {schema}")
+                    for row in tables_df.collect():
+                        table_name = row.tableName
+                        if needle in table_name.lower():
+                            result.results.append((schema, table_name))
+                except Exception:
+                    pass  # Skip schemas where SHOW TABLES fails
+
+        except Exception as e:
+            print(f"Warning: Could not search catalog '{catalog}': {e}")
+
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/config_models/transformation_config.py
+
+from abc import ABC
+from typing import Any, List
+from config_models.dataset_config import DatasetConfig
+from config_models.variable_config import VariableConfig
+from definitions import CONFIGS_DIR
+
+from config_models.collection_config import Collection, CollectionConfig
+from config_models.transformation_config_schema import TransformationConfigSchema
+from config_models import yaml_functions
+
+
+class TransformationConfig(ABC):
+    """_summary_
+    Class which represent the transformation's configuration.
+    """
+
+    collection_config: CollectionConfig
+    _transform_config: Any
+    _input_datasets: List[DatasetConfig]
+    _output_datasets: List[DatasetConfig]
+
+    def __init__(self, collection: Collection, environment, transformation):
+        self.collection_config = CollectionConfig(collection, environment)
+        config_path = f"{CONFIGS_DIR}/collections/{collection.name}/{transformation}.yml"
+        self._transform_config = yaml_functions.load_validated_config(
+            config_path, TransformationConfigSchema
+        )
+        self._input_datasets = []
+        self._output_datasets = []
+
+        for var in self._transform_config["input_variables"]:
+            t = DatasetConfig(**var)
+            t.path = self.collection_config.get_table_path(t.dataset, t.steady_state)
+            self._input_datasets.append(t)
+        for var in self._transform_config["output_variables"]:
+            t = DatasetConfig(**var)
+            t.path = self.collection_config.get_table_path(t.dataset, t.steady_state)
+            self._output_datasets.append(t)
+
+    @property
+    def input_datasets(self):
+        """_summary_
+        The list of input datasets
+        """
+        return self._input_datasets
+
+    @property
+    def output_datasets(self):
+        """_summary_
+        The list of output datasets
+        """
+        return self._output_datasets
+
+    def get_input_dataset(self, dataset: str):
+        """_summary_
+        Get a specific input dataset by alias, or name if alias is not defined.
+        Raises ValueError if dataset is not found
+        Args:
+            dataset (str): the dataset name
+        """
+        res = next((x for x in self._input_datasets if x.dataset == dataset), None)
+        if res is None:
+            raise ValueError(f"Input dataset {dataset} not found")
+        return res
+
+    def get_output_dataset(self, dataset: str):
+        """_summary_
+        Get a specific output dataset by alias, or name if alias is not defined.
+        Raises ValueError if dataset is not found
+        Args:
+            dataset (str): the dataset alias (or name)
+        """
+        res = next((x for x in self._output_datasets if x.key == dataset), None)
+        if res is None:
+            raise ValueError(f"Output dataset {dataset} not found")
+        return res
+
+    def get_input_variable(self, dataset: str, variable: str) -> VariableConfig:
+        """_summary_
+        Get a specific input variable by name (not alias).
+        Args:
+            dataset (str): the dataset alias (or name)
+            variable (str): the variable name (not alias).
+
+        Raises:
+            ValueError: if dataset or variable is not found
+
+        Returns:
+            VariableConfig: The variable
+        """
+        ds = self.get_input_dataset(dataset)
+        if ds.include_all_variables or ds.variables is None:
+            raise ValueError(
+                f"Individual input variables for dataset {dataset} not defined as 'all' was specified in the yaml"
+            )
+        for var in ds.variables:
+            if var.name == variable:
+                return var
+        raise ValueError(f"Input dataset {dataset} does not have a variable with name {variable}")
+
+    def get_output_variable(self, dataset: str, variable: str) -> VariableConfig:
+        """_summary_
+        Get a specific output variable by name (not alias).
+        Args:
+            dataset (str): the dataset alias (or name)
+            variable (str): the variable name (not alias)
+
+        Raises:
+            ValueError: if dataset or variable is not found
+
+        Returns:
+            VariableConfig: The variable
+        """
+        ds = self.get_output_dataset(dataset)
+
+        for var in ds.variables:
+            if var.name == variable:
+                return var
+        raise ValueError(f"Output dataset {dataset} does not have a variable with name {variable}")
+
+    @property
+    def etc(self):
+        """_summary_
+        Custom transform config as loaded from yaml file.
+        Returns a dict of the custom config
+        """
+        if "etc" in self._transform_config:
+            return self._transform_config["etc"]
+        return None
+
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/config_models/transformation_config_schema.py
+
+
+from typing import Any, List, Literal
+from pydantic import BaseModel, ConfigDict
+
+"""
+Classes for validating variable configuration using Pydantic after loading the config from yml file 
+"""
+
+
+class ResidualsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    not_stated: str = ""
+    response_out_of_scope: str = ""
+    response_unidentifiable: str = ""
+    does_not_know: str = ""
+    refused_to_answer: str = ""
+
+
+class InputVariable(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    alias: str = ""
+    type: str = ""
+    allow_blank: bool = False
+
+
+class OutputVariable(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    alias: str = ""
+    type: str = ""
+    classification: str = ""
+    level: int = 1
+    allow_blank: bool = False
+    min_value: int = 0
+    max_value: int = 0
+    numeric_code_length: int = 0
+    buffer_words_table: str = ""
+    lookup_table: str = ""
+    fuzzy_tolerance: float = 0.0
+    residuals: ResidualsConfig = None
+    expression: str = ""
+    internal: bool = False
+    is_pk: bool = False
+
+
+class InputSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    key: str = ""
+    steady_state: str
+    variables: List[InputVariable] | Literal["all"]
+
+
+class OutputSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    key: str = ""
+    steady_state: str
+    variables: List[OutputVariable]
+
+
+class TransformationConfigSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    input_variables: List[InputSource]
+    output_variables: List[OutputSource]
+    etc: Any = None
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/config_models/collection_config.py
+
+
+import os
+import string
+from typing import Dict, List
+from definitions import CONFIGS_DIR
+from enum import Enum
+from config_models.collection_config_schema import CollectionConfigSchema
+from config_models import yaml_functions
+import logging
+
+logger = logging.getLogger(__name__)
+
+"""_summary_
+Classes which represent the collection's configuration.
+"""
+
+
+class Collection(Enum):
+    """_summary_
+    Enum of valid collections.
+    """
+
+    social_census = "social_census"
+    config_test_survey = "config_test_survey"
+
+
+class _CatalogOverride:
+    environment: str
+    steady_state: str
+    use_catalog: str
+
+    def __init__(self, steady_state, use_catalog, environment):
+        self.environment = environment
+        self.use_catalog = use_catalog
+        self.steady_state = steady_state
+
+    def __repr__(self):
+        return (
+            f"CatalogOverride(environment={self.environment!r}, "
+            f"steady_state={self.steady_state!r}, "
+            f"use_catalog={self.use_catalog!r})"
+        )
+
+
+class _SchemaOverride:
+    environment: str
+    steady_state: str
+    use_schema: str
+
+    def __init__(self, steady_state, use_schema, environment=None):
+        self.environment = environment
+        self.use_schema = use_schema
+        self.steady_state = steady_state
+
+    def __repr__(self):
+        return (
+            f"SchemaOverride(environment={self.environment!r}, "
+            f"steady_state={self.steady_state!r}, "
+            f"use_schema={self.use_schema!r})"
+        )
+
+
+class _TableOverride:
+    dataset: str
+    steady_state: str
+    use_table: str
+
+    def __init__(self, dataset, steady_state, use_table):
+        self.dataset = dataset
+        self.steady_state = steady_state
+        self.use_table = use_table
+
+    def __repr__(self):
+        return f"TableOverride(dataset={self.dataset!r}, steady_state={self.steady_state!r}, use_table={self.use_table!r})"
+
+
+class _Overrides:
+    catalogs: List[_CatalogOverride] = []
+    schema: List[_SchemaOverride] = []
+    tables: List[_TableOverride] = []
+
+    def __init__(self, catalog=None, schema=None, table=None):
+        if catalog is not None:
+            self.catalogs = [_CatalogOverride(**data) for data in catalog]
+        if schema is not None:
+            self.schema = [_SchemaOverride(**data) for data in schema]
+        if table is not None:
+            self.tables = [_TableOverride(**data) for data in table]
+
+
+class _RootNames:
+    catalog_prefix: str
+    external_catalog_prefix: str
+    external_schema_prefix: str
+
+    def __init__(
+        self, catalog_prefix: str, external_catalog_prefix: str, external_schema_prefix: str
+    ):
+        self.catalog_prefix = catalog_prefix
+        self.external_catalog_prefix = external_catalog_prefix
+        self.external_schema_prefix = external_schema_prefix
+
+
+class _SteadyState:
+    name: str
+    is_external: bool = False
+    datasets: List[str]
+
+    def __init__(self, name: str, datasets: List[str], is_external: bool = False):
+        self.name = name
+        self.is_external = is_external
+        self.datasets = datasets
+
+
+class CollectionConfig:
+    """_summary_
+    Represents the collection's configuration.
+    Configration is loaded from "{CONFIGS_DIR}/collections/{collection.name}/config.yml"
+    and environment variable PROCESS_SANDBOX_USER
+    """
+
+    _config: Dict
+    _collection_name: str
+    _environment: str
+    _steady_states: List[_SteadyState]
+    _root_names: _RootNames
+    _overrides: _Overrides
+    _sandbox: str | None = None
+
+    def __init__(self, collection: Collection, environment):
+        assert isinstance(collection, Collection)
+        config_path = f"{CONFIGS_DIR}/collections/{collection.name}/config.yml"
+        logger.debug(f"Loading configuration file {config_path}")
+        print(f"Loading configuration file {config_path}")
+        self._config = yaml_functions.load_validated_config(config_path, CollectionConfigSchema)
+        self._collection_name = self._config["name"]
+        self._environment = environment
+        self._steady_states = [_SteadyState(**data) for data in self._config["steady_states"]]
+        self._overrides = _Overrides(**self._config["overrides"])
+        self._root_names = _RootNames(**self._config["root_names"])
+
+        sandbox = os.getenv("PROCESS_SANDBOX_USER")
+        if (sandbox is not None) and (not sandbox.isspace()):
+            assert sandbox.isalnum(), "%PROCESS_SANDBOX_USER% contains non-alphanumeric characters"
+            self._sandbox = f"development_{sandbox}"
+
+        assert environment is not None, "environment must be specified"
+        assert (
+            environment in self._config["valid_environments"]
+        ), f"{environment} not a valid environment for {collection.name}"
+
+    def _validate_dataset_name(self, dataset: str):
+        assert (
+            dataset in self._config["valid_datasets"]
+        ), f"Dataset {dataset} not defined in config.yml for {self._collection_name}"
+
+    def _validate_steady_state_value(self, steady_state: str):
+        assert steady_state in [
+            ss.name for ss in self._steady_states
+        ], f"Steady state {steady_state} not defined in config.yml for {self._collection_name}"
+
+    """
+    returns catalog calculated as
+    <root_names.external_catalog_prefix>_<environment> for external datasets
+    <root_names.catalog_prefix>_<environment> for internal steady states
+    unless there is a yaml override at overrides.catalog
+    """
+
+    def get_catalog(self, steady_state: str):
+        self._validate_steady_state_value(steady_state)
+        overridden = next(
+            (
+                x
+                for x in self._overrides.catalogs
+                if x.environment == self._environment and x.steady_state == steady_state
+            ),
+            None,
+        )
+        if overridden is not None:
+            return overridden.use_catalog
+
+        is_external_steady_state = next(
+            (x.is_external for x in self._steady_states if x.name == steady_state), None
+        )
+        if is_external_steady_state == True:
+            return f"{self._root_names.external_catalog_prefix}{self._environment}"
+        return f"{self._root_names.catalog_prefix}{self._environment}"
+
+    """
+    returns catalog and schema as
+    <root_names.external_catalog_prefix>_<environment>.survey_response_<steady_state> for external datasets
+    <root_names.catalog_prefix>.<collection>_<steady_state> for other steady states
+
+    e.g.  : socpophousdata1_dev.social_census_classified
+
+    If PROCESS_SANDBOX_USER is defined and we are using steady state defined in sand_box_steady_states, the 
+    sandbox schema is used
+    """
+
+    def get_catalog_and_schema(self, steady_state: str):
+        catalog = self.get_catalog(steady_state)
+
+        if self._sandbox is not None and steady_state in self._config["sand_box_steady_states"]:
+            return f"{catalog}.{self._sandbox}"
+
+        overrides = [x for x in self._overrides.schema if x.steady_state == steady_state]
+        if len(overrides):
+            override_by_env = next(
+                (x for x in overrides if x.environment == self._environment), None
+            )
+            if override_by_env is not None:
+                return f"{catalog}.{override_by_env.use_schema}"
+            overridden = next((x for x in overrides if x.environment is None), None)
+            if overridden is not None:
+                return f"{catalog}.{overridden.use_schema}"
+
+        is_external_steady_state = next(
+            (x.is_external for x in self._steady_states if x.name == steady_state), None
+        )
+
+        if is_external_steady_state == True:
+            return f"{catalog}.{self._root_names.external_schema_prefix}{steady_state}"
+
+        return f"{catalog}.{self._collection_name}_{steady_state}"
+
+    def get_table_path(self, dataset, steady_state):
+        schema = self.get_catalog_and_schema(steady_state)
+        valid_datasets = next(
+            (x.datasets for x in self._steady_states if x.name == steady_state), None
+        )
+        assert valid_datasets is not None, f"No datasets defined for steady state {steady_state}"
+        assert (
+            dataset in valid_datasets
+        ), f"Dataset {dataset} not defined for steady state {steady_state}"
+        overridden = next(
+            (
+                x
+                for x in self._overrides.tables
+                if x.dataset == dataset and x.steady_state == steady_state
+            ),
+            None,
+        )
+        if overridden is not None:
+            return f"{schema}.{overridden.use_table}"
+        return f"{schema}.{dataset}"
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/config_models/collection_config_schema.py
+
+
+from typing import List
+from pydantic import BaseModel, ConfigDict, Field
+
+"""
+Classes for validating collection configuration using Pydantic after loading the config from yml file 
+"""
+
+
+class CatalogOverrideSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    environment: str
+    steady_state: str
+    use_catalog: str
+
+
+class SchemaOverrideSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    environment: str = None
+    steady_state: str
+    use_schema: str
+
+
+class TableOverrideSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    steady_state: str
+    use_table: str
+
+
+class OverridesSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_: List[SchemaOverrideSchema] = Field(alias="schema")
+    catalog: List[CatalogOverrideSchema] = List[str]
+    table: List[TableOverrideSchema] = List[str]
+
+
+class RootNamesSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    catalog_prefix: str
+    external_catalog_prefix: str
+    external_schema_prefix: str
+
+
+class SteadyState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    is_external: bool = False
+    datasets: List[str] | None
+
+
+class CollectionConfigSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    valid_environments: List[str]
+    steady_states: List[SteadyState]
+    sand_box_steady_states: List[str]
+    root_names: RootNamesSchema
+    overrides: OverridesSchema
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/config_models/variable_config.py
+
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+from config_models.residual_config import ResidualConfig
+
+if TYPE_CHECKING:
+    from config_models.transformation_config import DatasetConfig
+
+
+class VariableConfig:
+    """_summary_
+    Configration for an individual variable as read from transformation yml file
+    """
+
+    name: str
+    dataset: DatasetConfig
+    type: str
+    classification: str
+    level: int
+    allow_blank: bool
+    numeric_code_length: int
+    min_value: int
+    max_value: int
+    allow_blank: bool
+    buffer_words_table: str | None
+    lookup_table: str | None
+    fuzzy_tolerance: float | None
+    residuals: ResidualConfig
+    expression: str = ""
+    internal: bool = False
+    is_pk: bool = False
+
+    _alias: str = None
+
+    def __init__(
+        self,
+        name: str,
+        dataset: DatasetConfig,
+        alias: str = None,
+        type: str = None,
+        classification: str = None,
+        level: int = None,
+        numeric_code_length: int = None,
+        min_value: int = None,
+        max_value: int = None,
+        allow_blank: bool = True,
+        buffer_words_table: str | None = None,
+        lookup_table: str | None = None,
+        fuzzy_tolerance: float | None = None,
+        residuals: ResidualConfig = None,
+        expression: str = None,
+        internal: bool = False,
+        is_pk: bool = False
+    ):
+        self.name = name
+        self.dataset = dataset
+        self._alias = alias
+        self.type = type
+        self.classification = classification
+        self.level = level
+        self.numeric_code_length = numeric_code_length
+        self.min_value = min_value
+        self.max_value = max_value
+        self.allow_blank = allow_blank
+        self.buffer_words_table = buffer_words_table
+        self.lookup_table = lookup_table
+        self.fuzzy_tolerance = fuzzy_tolerance
+        self.residuals = ResidualConfig() if residuals is None else ResidualConfig(**residuals)
+        self.expression = expression
+        self.internal = internal
+        self.is_pk = is_pk
+
+    def __repr__(self):
+        return (
+            f"VariableConfig(name={self.name!r}, alias={self.alias!r}, type={self.type!r}, "
+            f"classification={self.classification!r}, level={self.level!r}, "
+            f"allow_blank={self.allow_blank!r})"
+        )
+
+    @property
+    def alias(self):
+        return self._alias if self._alias is not None else self.name
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/config_models/yaml_functions.py
+
+import os
+from typing import Any
+from pydantic import BaseModel, ValidationError
+import yaml
+
+"""_summary_
+Utilities to suppot configuration classes
+"""
+
+
+def load_config(config_file: str) -> dict:
+    """_reads provided yaml file as dicts_
+
+    Args:
+        config_file (str): _path to the yaml file_
+
+    Returns:
+        dict: _The yaml file as dicts_
+    """
+    assert os.path.exists(config_file), f"Configuration file not found at {config_file}"
+
+    config: Any
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def load_validated_config(config_file: str, schema: BaseModel) -> dict:
+    """_summary_
+
+    Args:
+        config_file (str): _path to the yaml file_
+        schema (BaseModel): _pydantic schema to validate loaded config against_
+
+    Raises:
+        Exception: _Should validation fail. Message includes path to the file and the failure reason._
+
+    Returns:
+        dict: _The yaml file as validated dicts_
+    """
+    config = load_config(config_file)
+
+    try:
+        schema(**config)
+    except ValidationError as e:
+        raise Exception(f"Error validating schema of configuration from {config_file}\n{e}")
+    return config
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/config.yml
+
+name: social_census
+valid_environments:
+  - dev
+  - tst1
+  - uat1
+steady_states:
+  - name: ess1
+    is_external: true
+    datasets:
+      - census_df
+      - census_hsf
+      - census_if
+  - name: reference_data
+    datasets:
+      - aria_classification
+      - aria_synonym
+      - aria_concordance
+      - op_frame # census_operational_frame
+  - name: parsing
+    datasets:
+      - individual
+      - dwelling
+      - household
+      - dwelling_person
+  - name: validated
+    datasets:
+      - individual
+      - dwelling
+      - household
+  - name: aria_classify
+    datasets:
+      - date_of_birth
+      - ethnicity
+      - ur_address
+  - name: classified
+    datasets:
+      - individual
+      - individual_para
+      - dwelling
+      - household
+      - operational_frame
+  - name: admin_linked
+    datasets:
+    - individual
+      - dwelling
+      - household
+      - admin_id_concordance
+      - admin_linking_log
+  - name: de_identified
+    datasets:
+      - individual
+      - dwelling
+      - household
+  - name: logs
+    datasets:
+      - pipeline_run
+      - events
+      - exceptions
+sand_box_steady_states:
+  - parsing
+  - validated
+  - aria_classify
+  - classified
+  - logs
+root_names:
+  catalog_prefix: socpophousdata1_
+  external_catalog_prefix: social_census_
+  external_schema_prefix: census_survey_
+overrides:
+  catalog:
+    - environment: dev
+      steady_state: ess1
+      use_catalog: socpophousdata1_dev
+    - environment: tst1
+      steady_state: ess1
+      use_catalog: socpophousdata1_tst1
+  schema: 
+    - steady_state: ess1
+      use_schema: census_survey_ess1
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/individual/individual_parsing.yml
+
+
+name: ESS1
+input_variables:
+  - steady_state: ess1
+    dataset: census_if
+    key: responses
+    variables:
+    # ── Spec: Metadata Mapping ───────────────────────────────────────────────
+    - name: responseId            # Mandatory | string | len 18
+      type: string
+
+    - name: uoi                   # Mandatory | string | len 7–14
+      type: string
+
+    - name: collectionInstance    # Mandatory | string
+      type: string
+
+    - name: _rescued_data         # Optional | string (failed JSON parse rows)
+      type: string
+
+    - name: caseId                # Mandatory | string | len 18
+      type: string
+
+    - name: sourceSubmittedAt     # Mandatory | string | len 21
+      type: string
+
+    - name: metadata              # Optional | string (JSON – contains collectionMode)
+      type: json
+
+    - name: data                  # Mandatory | string (raw JSON blob)
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+
+output_variables:
+  - dataset: individual
+    steady_state: parsing
+    variables:
+    # ── Spec: Metadata Mapping ───────────────────────────────────────────────
+    - name: person_nbr            # Mandatory | string | len 18 | from responseId
+      expression: responseId
+      type: string
+      is_pk: true
+
+    - name: i_dwell_nbr           # Mandatory | string | len 7–14 | from uoi
+      expression: uoi
+      type: string
+
+    - name: collection_instance   # Mandatory | string | from collectionInstance
+      expression: collectionInstance
+      type: string
+      is_pk: true
+
+    - name: _rescued_data          # Optional | string | from _rescued_data
+      expression: _rescued_data
+      type: string
+
+    - name: i_id                  # Mandatory | string | len 18 | from caseId
+      expression: caseId
+      type: string
+      is_pk: true
+
+    - name: i_submitted_date_time # Mandatory | string | len 21 | from sourceSubmittedAt
+      expression: sourceSubmittedAt
+      type: timestamp
+
+    - name: i_mode                # Mandatory | string | len 5–6 | Online/Phone/Visit
+      expression: metadata:collectionMode
+      type: string
+
+    # ── Spec: Data Mapping – DART ────────────────────────────────────────────
+    - name: i_age                 # Optional | integer | 0–120 | from IF_age_calculated
+      type: short               # kept as integer: Delta does not support narrowing to tinyint on existing table
+      expression: data:IF_age_calculated
+
+    - name: i_dob_day             # Optional | numeric | 1–31 | from IF_date_of_birth.day
+      type: tinyint              # Bug fix #2: spec says Type: numeric
+      expression: data:IF_date_of_birth:day
+
+    - name: i_dob_month           # Optional | numeric | 1–12 | from IF_date_of_birth.month
+      type: tinyint               # Bug fix #2: spec says Type: numeric
+      expression: data:IF_date_of_birth:month
+
+    - name: i_dob_year            # Optional | numeric | from IF_date_of_birth.year
+      type: short               # Bug fix #2: spec says Type: numeric
+      expression: data:IF_date_of_birth:year
+
+    - name: i_gender_predefined   # Optional | string | male/female/another
+      type: string
+      expression: data:IF_gender_predefined:true
+
+    - name: i_gender_text         # Optional | string | len ≤60
+      type: string
+      expression: data:IF_gender_text
+
+    - name: i_gender_ayt_code      # Optional | string (classification code) – renamed in spec v1(1)
+      type: string
+      expression: data:IF_gender_text_AYT
+
+    - name: i_ethnic_group_predefined  # Mandatory | string | semicolon-separated values
+      type: string
+      expression: data:IF_ethnic_group_predefined:true
+
+    - name: i_ethnic_group_text_1 # Optional | string | len ≤50
+      type: string
+      expression: data:IF_ethnic_group_text_1
+
+    - name: i_ethnic_group_text_2
+      type: string
+      expression: data:IF_ethnic_group_text_2
+
+    - name: i_ethnic_group_text_3
+      type: string
+      expression: data:IF_ethnic_group_text_3
+
+    - name: i_ethnic_group_text_4
+      type: string
+      expression: data:IF_ethnic_group_text_4
+
+    - name: i_ethnic_group_text_5
+      type: string
+      expression: data:IF_ethnic_group_text_5
+
+    - name: i_ethnic_group_text_6
+      type: string
+      expression: data:IF_ethnic_group_text_7
+
+    - name: i_ethnic_group_ayt_1_code  # Optional | string | len ≤5 – renamed in spec v1(1)
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_1
+
+    - name: i_ethnic_group_ayt_2_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_2
+
+    - name: i_ethnic_group_ayt_3_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_3
+
+    - name: i_ethnic_group_ayt_4_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_4
+
+    - name: i_ethnic_group_ayt_5_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_5
+
+    - name: i_ethnic_group_ayt_6_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_6
+
+    - name: i_maori_descent       # Mandatory | string | yes/no/dont_know/refused
+      type: string
+      expression: data:IF_maori_descent
+
+    - name: i_first_name_hsf       # Optional | string | len ≤60 | from IF_name.1 – renamed in spec v1(1)
+      type: string
+      expression: data:IF_name:1
+
+    - name: i_family_name_hsf      # Optional | string | len ≤30 | from IF_name.2 – renamed in spec v1(1)
+      type: string
+      expression: data:IF_name:2
+
+    - name: i_first_name_piped    # Optional | string | len ≤60 | from IF_piped_names.first
+      type: string
+      expression: data:IF_piped_names:first 
+
+    - name: i_family_name_piped   # Optional | string | len ≤30 | from IF_piped_names.family
+      type: string
+      expression: data:IF_piped_names:family
+
+    - name: i_first_names         # Optional | string | len ≤60 | from IF_names.first_names
+      type: string
+      expression: data:IF_names:first_names
+
+    - name: i_family_name        # Optional | string | len ≤30 | from IF_names.family_names
+      type: string
+      expression: data:IF_names:family_name
+
+    - name: i_name_confirmed      # Optional | string | yes/no/refused/dont_know
+      type: string
+      expression: data:IF_names_confirmed
+
+    - name: i_ur_address_confirmed # Optional | string | yes/no/refused/dont_know
+      type: string
+      expression: data:IF_ur_address_confirmed
+
+    - name: i_ur_address_predefined  # Optional | string | new_zealand/overseas
+      type: string
+      expression: data:IF_ur_address_predefined
+
+    - name: i_ur_address_text     # Optional | string | len 10–120
+      type: string
+      expression: data:IF_ur_address_text
+
+    - name: i_sex_at_birth        # Optional | string | Male/female/refused/dont_know
+      type: string
+      expression: data:IF_sex_at_birth
+
+    - name: i_country_of_birth_predefined  # Optional | string | new zealand/overseas/… (Bug fix #3)
+      type: string
+      expression: data:IF_country_of_birth_predefined
+
+    - name: i_country_of_birth_text        # Optional | string | len ≤60 (Bug fix #3)
+      type: string
+      expression: data:IF_country_of_birth_text
+
+    - name: i_country_of_birth_ayt_code     # Optional | string | len 2–5 coded – renamed in spec v1(1)
+      type: string
+      expression: data:IF_country_of_birth_text_AYT
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/household/dwelling_person_parsing.yml
+
+name: Household
+input_variables:
+  - steady_state: ess1
+    dataset: census_hsf
+    key: responses
+    variables:
+    - name: collectionInstance    # Mandatory | string
+      type: string
+
+    - name: caseId                   # Mandatory | string | len 18
+      type: string
+
+    - name: metadata
+      type: json
+
+    - name: responseId            # Mandatory | string | len 18
+      type: string
+
+    - name:  sourceSubmittedAt # Mandatory | string | len 21
+      type: string
+
+    - name: uoi              # Mandatory | string | len 7–14
+      type: string
+
+    - name: data                   # Mandatory | string (raw JSON blob)
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+
+output_variables:
+  - dataset: dwelling_person
+    steady_state: parsing
+    variables:
+    # ── Metadata Mapping ────────────────────────────────────────────
+    - name: collection_instance
+      expression: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: h_id
+      expression: caseId                   # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_mode
+      expression: metadata:collectionMode
+      type: string
+
+    - name: hsf_response_id
+      expression: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_submitted_date_time
+      expression: sourceSubmittedAt # Mandatory | string | len 21
+      type: timestamp
+
+    - name: dwell_nbr
+      expression: uoi              # Mandatory | string | len 7–14 | Needs to be in both household and dwelling person datasets
+      type: string
+
+    - name: loop_people_here      
+      expression: posexplode:data:LoopPeopleHere
+      type: string
+      internal: true
+
+    - name: ref_person
+      expression: CASE WHEN loop_people_here_index = 0 THEN 1 ELSE 0 END
+      type: string
+
+    - name: loop_people_here_index
+      expression: loop_people_here_index
+      type: string
+      is_pk: true
+
+    - name: age
+      expression: loop_people_here:HSF_here_age
+      type: integer
+
+    - name: another
+      expression: loop_people_here:HSF_here_another
+      type: string
+      
+    - name: gender
+      expression: loop_people_here:HSF_here_gender:true
+      type: string
+
+    - name: family_name
+      expression: loop_people_here:HSF_here_name:family_name
+      type: string
+      
+    - name: first_names
+      expression: loop_people_here:HSF_here_name:first_names
+      type: string
+
+    - name: relationship
+      expression: loop_people_here:HSF_here_relationship
+      type: string
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/household/household_parsing.yml
+
+name: Household
+input_variables:
+  - steady_state: ess1
+    dataset: census_hsf
+    key: responses
+    variables:
+    - name: collectionInstance    # Mandatory | string
+      type: string
+
+    - name: _rescued_data           # Optional | string (failed JSON parse rows)
+      type: string
+
+    - name: caseId                   # Mandatory | string | len 18
+      type: string
+
+    - name: metadata
+      type: json
+
+    - name: responseId            # Mandatory | string | len 18
+      type: string
+
+    - name:  sourceSubmittedAt # Mandatory | string | len 21
+      type: string
+
+    - name: uoi              # Mandatory | string | len 7–14
+      type: string
+
+    - name: data                   # Mandatory | string (raw JSON blob)
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+
+output_variables:
+  - dataset: household
+    steady_state: parsing
+    variables:
+    # ── Metadata Mapping ────────────────────────────────────────────
+    - name: collection_instance
+      expression: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: _rescued_data           # Optional | string (failed JSON parse rows)
+      expression: _rescued_data
+      type: string
+
+    - name: h_id
+      expression: caseId                   # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_mode
+      expression: metadata:collectionMode
+      type: string
+
+    - name: hsf_response_id
+      expression: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_submitted_date_time
+      expression: sourceSubmittedAt # Mandatory | string | len 21
+      type: timestamp
+
+    - name: dwell_nbr
+      expression: uoi              # Mandatory | string | len 7–14 | Needs to be in both household and dwelling person datasets
+      type: string
+
+    # ── Data Mapping – DART ────────────────────────────────────────
+    - name: h_new_address          # Optional | string | len 10–120 | from HSF_new_address
+      expression: data:HSF_new_address
+      type: string
+
+    - name: h_usually_live         # Optional | string | Yes/missing | from HSF_usually_live
+      expression: data:HSF_usually_live 
+      type: string
+
+    - name: h_last_access_date     # Mandatory | string | len 19 | from HSF_lastAccessDate
+      expression: data:HSF_lastAccessDate 
+      type: timestamp
+
+    - name: h_number_of_occupants  # Mandatory | integer | 0–30 | from HSF_number_of_occupants
+      expression: data:HSF_number_of_occupants 
+      type: integer
+
+    - name: h_occupant_names       # Mandatory | string | from HSF_occupantNames (JSON object)
+      expression: data:HSF_occupantNames 
+      type: string
+
+    - name: h_piped_address        # Mandatory | string | len 10–120 | from HSF_piped_address
+      expression: data:HSF_piped_address 
+      type: string
+
+    - name: h_no_ur_declaration    # Optional | string | from HSF_no_ur_declaration.true
+      expression: data:HSF_no_ur_declaration:true  
+      type: string
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/dwelling/dwelling_parsing.yml
+
+# dwelling/parsing.yml
+name: ESS1
+input_variables:
+  - steady_state: ess1
+    dataset: census_df
+    key: responses
+    variables:
+    - name: collectionInstance
+      type: string
+
+    - name: _rescued_data
+      type: string
+
+    - name: caseId
+      type: string
+
+    - name: metadata
+      type: json
+
+    - name: responseId
+      type: string
+
+    - name: sourceSubmittedAt
+      type: string
+
+    - name: uoi
+      type: string
+
+    - name: data
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+ 
+output_variables:
+  - steady_state: parsing
+    dataset: dwelling
+    variables:
+    # ── Metadata Mapping ───────────────────────────────────────────────
+    - name: collection_instance
+      type: string
+      expression: collectionInstance
+      is_pk: true
+
+    - name: _rescued_data
+      type: string
+      expression: _rescued_data
+
+    - name: d_id
+      type: string
+      expression: caseId
+      is_pk: true
+
+    - name: d_mode
+      type: string
+      expression: metadata:collectionMode
+
+    - name: df_response_id
+      type: string
+      expression: responseId
+      is_pk: True
+
+    - name: d_submitted_date_time
+      type: timestamp
+      expression: sourceSubmittedAt
+
+    - name: dwell_nbr
+      type: string
+      expression: uoi
+
+    # ── Data Mapping ───────────────────────────────────────────────────
+    - name: d_us_live_check
+      type: string
+      expression: data:DF_us_live_check
+
+    - name: d_dwell_description_predefined
+      type: string
+      expression: data:DF_dwelling_description_predefined
+
+    - name: d_dwell_description_text
+      type: string
+      expression: data:DF_dwelling_description_text
+
+    - name: d_joined_ind
+      type: string
+      expression: data:DF_joined
+
+    - name: d_storeys
+      type: string
+      expression: data:DF_storeys
+
+    - name: d_owned_or_family_trust
+      type: string
+      expression: data:DF_dwelling_ownership
+
+    - name: d_mortgage_payments
+      type: string
+      expression: data:DF_mortgage_payments
+
+    - name: d_sector_of_landlord
+      type: string
+      expression: data:DF_sector_of_landlord
+
+    - name: d_rent_ind
+      type: string
+      expression: data:DF_rent
+
+    - name: d_rent_amount
+      type: integer
+      expression: data:DF_rent_details_amount:amount
+
+    - name: d_rent_period_predefined
+      type: string
+      expression: data:DF_rent_details_period_predefined
+
+    - name: d_rent_period_text
+      type: string
+      expression: data:DF_rent_details_period_text
+
+    - name: d_bedroom_count
+      type: tinyint
+      expression: data:DF_rooms:bedroom_count
+
+    - name: d_conservatory_count
+      type: tinyint
+      expression: data:DF_rooms:conservatory_count
+
+    - name: d_dining_room_count
+      type: tinyint
+      expression: data:DF_rooms:dining_room_count
+
+    - name: d_kitchen_room_count
+      type: tinyint
+      expression: data:DF_rooms:kitchen_count
+
+    - name: d_living_room_count
+      type: tinyint
+      expression: data:DF_rooms:living_room_count
+
+    - name: d_study_room_count
+      type: tinyint
+      expression: data:DF_rooms:study_room_count
+
+    - name: d_heating_predefined
+      type: string
+      expression: data:DF_heating_predefined:true
+
+    - name: d_heating_text
+      type: string
+      expression: data:DF_heating_text
+
+    - name: d_heating_text_ayt_code
+      type: string
+      expression: data:DF_heating_text_AYT
+
+    - name: d_heating_text_ayt_other
+      type: string
+      expression: data:`DF_heating_text_AYT.other$other`
+
+    - name: d_telecommunication
+      type: string
+      expression: data:DF_telecommunications:true
+
+    - name: d_mobile
+      type: string
+      expression: data:DF_mobile
+
+    - name: d_telephone
+      type: string
+      expression: data:DF_telephone
+
+    - name: d_internet
+      type: string
+      expression: data:DF_internet
+
+    - name: d_motor_vehicle_count_predefined
+      type: string
+      expression: data:DF_motor_vehicle_count_predefined
+
+    - name: d_motor_vehicle_count_text
+      type: tinyint
+      expression: data:DF_motor_vehicle_count_text
+
+    - name: d_damp
+      type: string
+      expression: data:DF_dwelling_damp
+
+    - name: d_damp_always
+      type: string
+      expression: data:DF_damp_always
+
+    - name: d_mould
+      type: string
+      expression: data:DF_mould
+
+    - name: d_mould_always
+      type: string
+      expression: data:DF_mould_always
+
+    - name: d_amenities
+      type: string
+      expression: data:DF_amenities:true
+
+    - name: declaration
+      type: string
+      expression: data:DF_declaration:true
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/transformations/schema_operations.py
+
+
+from typing import List
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    ByteType,
+    StructType,
+    StructField,
+    StringType,
+    IntegerType,
+    ShortType,
+    LongType,
+    TimestampType,
+)
+from pyspark.sql.utils import AnalysisException
+
+from config_models.transformation_config import VariableConfig
+
+_TYPE_MAP = {
+    "string": StringType(),
+    "integer": IntegerType(),
+    "tinyint": ByteType(),
+    "short": ShortType(),
+    "long": LongType(),
+    "timestamp": TimestampType(),
+}
+
+
+def build_schema(output_variables: List[VariableConfig]) -> StructType:
+    """
+    Build expected schema using YAML variable definitions.
+    Uses v.name as physical column name.
+    """
+    fields = []
+
+    for variable in output_variables:
+        if variable.internal:
+            continue
+
+        if variable.type not in _TYPE_MAP:
+            raise ValueError(
+                f"Unsupported type {variable.type!r} for variable {variable.name!r}. "
+                f"Supported: {sorted(_TYPE_MAP)}"
+            )
+
+        fields.append(
+            StructField(variable.name, _TYPE_MAP[variable.type], variable.allow_blank)
+        )
+
+    return StructType(fields)
+
+
+def get_schema_mismatches(*, actual: StructType, expected: StructType) -> List[dict]:
+    """
+    Compare expected schema against actual schema (order-insensitive).
+
+    Returns a list of mismatch records:
+        {
+            "column": "<column_name>",
+            "mismatch_type": "missing_in_actual" |
+                             "data_type_mismatch" |
+                             "nullability_mismatch",
+            "expected": "<expected_value>",
+            "actual": "<actual_value>" | None,
+        }
+
+    Notes:
+    - Extra columns in actual schema are ignored.
+    - One column can generate multiple records (e.g., type + nullability mismatch).
+    """
+
+    actual_fields = {field.name: field for field in actual.fields}
+    mismatches = []
+
+    for expected_field in expected.fields:
+        column_name = expected_field.name
+
+        if column_name not in actual_fields:
+            mismatches.append({
+                "column": column_name,
+                "mismatch_type": "missing_in_actual",
+                "expected": f"{expected_field.dataType.simpleString()} (nullable={expected_field.nullable})",
+                "actual": None,
+            })
+            continue
+
+        actual_field = actual_fields[column_name]
+
+        # Compare data types
+        if actual_field.dataType != expected_field.dataType:
+            mismatches.append({
+                "column": column_name,
+                "mismatch_type": "data_type_mismatch",
+                "expected": expected_field.dataType.simpleString(),
+                "actual": actual_field.dataType.simpleString(),
+            })
+
+        # Compare nullability
+        if actual_field.nullable != expected_field.nullable:
+            mismatches.append({
+                "column": column_name,
+                "mismatch_type": "nullability_mismatch",
+                "expected": f"nullable={expected_field.nullable}",
+                "actual": f"nullable={actual_field.nullable}",
+            })
+
+    return mismatches
+
+
+def validate_schema(df, expected_schema):
+    # Ignore column order
+    actual = StructType(sorted(df.schema, key=lambda x: x.name))
+    expected = StructType(sorted(expected_schema, key=lambda x: x.name))
+    if actual != expected:
+        raise ValueError(
+            f"""
+Schema mismatch detected!
+
+Expected schema:
+{expected}
+
+Actual schema:
+{actual}
+"""
+        )
+
+
+def table_exists(spark: SparkSession, table_path: str) -> bool:
+    """
+    Return True when the table can be referenced via the metastore catalog.
+
+    Used as a precondition for schema-mismatch checks and as a gate
+    before parsing — when the target table does not yet exist, parsing
+    output cannot be written, so the job should fail early.
+    """
+    try:
+        spark.table(table_path).limit(0).collect()
+        return True
+    except AnalysisException:
+        return False
+
+
+
+
+
+
+
+
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/definitions.py file:
+
+import os
+import sys
+from dotenv import load_dotenv
+
+from pyspark.sql import SparkSession
+from databricks.connect import DatabricksSession
+from pyspark.dbutils import DBUtils
+from databricks.sdk import WorkspaceClient
+
+"""
+Sorts out sys.path for notebooks to ensure / and /src are both in the path. 
+Also provides variables: 
+PROJECT_DIR = the pathh to the src folder
+ROOT_DIR = the path to the checkout folder
+CONFIGS_DIR = the path to the configuration folder
+"""
+dbutils: DBUtils
+if "dbutils" not in globals():
+    w = WorkspaceClient()
+    dbutils = w.dbutils
+else:
+    dbutils = dbutils
+
+notebook_path = (
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+)
+notebook_file = os.path.basename(notebook_path)
+
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(notebook_file)))  # src folder
+ROOT_DIR = os.path.dirname(PROJECT_DIR)
+CONFIGS_DIR = os.path.join(ROOT_DIR, "configuration")
+
+if PROJECT_DIR not in sys.path:
+    sys.path.append(PROJECT_DIR)
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+load_dotenv()
+
+spark: SparkSession
+if "spark" not in globals():
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        spark = DatabricksSession.builder.serverless().getOrCreate()
+else:
+    spark = spark
+
