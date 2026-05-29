@@ -1,8 +1,8 @@
 
-currently, my team has wiki pages where we contain documentation of our project. I may have shared with you a wiki page related to Exception logs and Event logs design guide. now, i want to add subpages for each exception logs and event logs as API documentation. I want to add details like what each logging module does, how it works, what parameters it can take, what is output of specific logging module and where the output is saved. how mention how to run logging in different enviornments. If I missed details that are helpful in understanding and using of logging module for new users, add those details as well.
+currently, my team has wiki pages where we contain documentation of our project. 
 
 
-we will make the improvements later. As of now, I am creating documentation for the Logger module on Azure Devops in Wiki pages. I currently have these docs pages.
+we will make the improvements later. As of now, I am creating documentation for the Logger module on Azure Devops in Wiki pages. I currently have these docs pages. I am sharing with you a wiki page related to Exception logs and Event logs design guide. also, also provided wiki subpage for error codes under Exception logs main page.
 
 
 Exception Logs
