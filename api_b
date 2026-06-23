@@ -1,0 +1,144 @@
+# base_logger.py
+"""BaseLogger — buffered writer shared by EventLogger and ExceptionLogger.
+
+The target Delta table must already exist (created by migration SQL). The
+logger reads its schema at runtime and aligns every record to it.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import List, Optional
+
+from pyspark.sql import Column, SparkSession, functions as F
+from pyspark.sql.types import StructType
+
+log = logging.getLogger(__name__)
+
+
+class TableContractError(RuntimeError):
+    """Raised when the target log table is missing."""
+
+
+def resolve_log_column(
+    df_columns: List[str],
+    *,
+    field: str,
+    const,
+    column: Optional[str],
+    required: bool = False,
+) -> Column:
+    """Return a Spark Column for a field supplied as a constant or a df column."""
+    if const is not None and column is not None:
+        raise ValueError(f"Pass either `{field}` or `{field}_column`, not both.")
+    if required and const is None and column is None:
+        raise ValueError(f"Provide `{field}` or `{field}_column`.")
+    if column is not None:
+        if column not in df_columns:
+            raise ValueError(f"Column {column!r} not in DataFrame: {df_columns}")
+        return F.col(column)
+    return F.lit(const)
+
+
+class BaseLogger:
+    """Buffers structured records and appends them to a Delta log table."""
+
+    def __init__(
+        self,
+        spark: SparkSession,
+        table_path: str,
+        batch_size: int,
+        run_id: str,
+        task_key: str,
+    ):
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        if not str(run_id).strip():
+            raise ValueError("run_id is required")
+        if not str(task_key).strip():
+            raise ValueError("task_key is required")
+
+        self._spark = spark
+        self._table_path = table_path
+        self._batch_size = batch_size
+        self._run_id = str(run_id)
+        self._task_key = str(task_key)
+        self._buffer: List[dict] = []
+
+        if not spark.catalog.tableExists(table_path):
+            raise TableContractError(
+                f"Log table {table_path!r} does not exist; "
+                f"create it via migration SQL."
+            )
+        self._schema: StructType = spark.table(table_path).schema
+        self._schema_field_names = self._schema.fieldNames()
+        self._schema_field_name_set = set(self._schema_field_names)
+
+    def __enter__(self) -> "BaseLogger":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        try:
+            self.flush()
+        except Exception as flush_exc:
+            if exc_val is None:
+                raise
+            log.error("Flush failed on exit for %s: %s", self._table_path, flush_exc)
+        return False
+
+    def flush(self) -> None:
+        """Append buffered records; the buffer is cleared only after a successful write."""
+        if not self._buffer:
+            return
+        try:
+            records = [self._align(r) for r in self._buffer]
+            df = self._spark.createDataFrame(records, schema=self._schema)
+            df.write.mode("append").format("delta").saveAsTable(self._table_path)
+        except Exception as exc:
+            log.warning(
+                "Flush failed for %s (%d records retained): %s",
+                self._table_path, len(self._buffer), exc,
+            )
+            raise RuntimeError(
+                f"Failed to write {len(self._buffer)} record(s) to {self._table_path}"
+            ) from exc
+        self._buffer.clear()
+
+    @property
+    def buffer_size(self) -> int:
+        return len(self._buffer)
+
+    @property
+    def table_path(self) -> str:
+        return self._table_path
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def task_key(self) -> str:
+        return self._task_key
+
+    def _add_to_buffer(self, record: dict) -> None:
+        self._buffer.append(record)
+        if len(self._buffer) >= self._batch_size:
+            self.flush()
+
+    def _execution_fields(self) -> dict:
+        return {"run_id": self._run_id, "task_key": self._task_key}
+
+    def _to_table_schema(self, df):
+        """Cast and order columns to match the target table exactly."""
+        return df.select(
+            *[F.col(f.name).cast(f.dataType).alias(f.name) for f in self._schema.fields]
+        )
+
+    def _align(self, record: dict) -> dict:
+        """Reject misspelled keys; fill any missing table columns with None."""
+        extra = set(record) - self._schema_field_name_set
+        if extra:
+            raise ValueError(
+                f"Record has field(s) not in {self._table_path!r}: {sorted(extra)}"
+            )
+        return {name: record.get(name) for name in self._schema_field_names}
