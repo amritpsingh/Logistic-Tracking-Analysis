@@ -1,0 +1,113 @@
+# event_logger.py
+"""EventLogger — writes non-fatal observation events to the events Delta table."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from pyspark.sql import functions as F
+
+from .base_logger import BaseLogger, resolve_log_column
+from .table_resolver import ensure_logger_widgets, resolve_log_table_path
+
+_LOG_TABLE_ENV_VAR = "CENSUS_EVENT_LOG_TABLE"
+_DEFAULT_BATCH_SIZE = 10000
+
+
+class EventLogger(BaseLogger):
+    """Buffered writer for social_census_logs.events. One instance per task."""
+
+    @classmethod
+    def for_task(
+        cls,
+        spark,
+        *,
+        run_id: str,
+        task_key: str,
+        log_table_path: Optional[str] = None,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "EventLogger":
+        ensure_logger_widgets()
+        table = resolve_log_table_path(
+            dataset="events",
+            explicit_table_path=log_table_path,
+            env_var_name=_LOG_TABLE_ENV_VAR,
+            widget_name="event_log_table",
+        )
+        return cls(
+            spark=spark, table_path=table, batch_size=batch_size,
+            run_id=run_id, task_key=task_key,
+        )
+
+    def log(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        variable_name: Optional[str] = None,
+    ) -> None:
+        """Log one observation event."""
+        self._add_to_buffer({
+            **self._execution_fields(),
+            "id": str(uuid.uuid4()),
+            "source_table": source_table,
+            "target_table": target_table,
+            "event_type": event_type,
+            "rule_name": rule_name,
+            "message": message,
+            "response_id": response_id,
+            "case_id": case_id,
+            "collection_instance_id": collection_instance_id,
+            "variable_name": variable_name,
+            "created_timestamp_utc": datetime.now(timezone.utc),
+        })
+
+    def log_dataframe(
+        self,
+        df,
+        *,
+        event_type: str,
+        response_id_column: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        message: Optional[str] = None,
+        message_column: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        rule_name_column: Optional[str] = None,
+        case_id_column: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        collection_instance_id_column: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
+    ) -> int:
+        """Append one event row per DataFrame row in a single distributed write."""
+        cols = df.columns
+        if response_id_column not in cols:
+            raise ValueError(f"response_id_column {response_id_column!r} not in {cols}")
+
+        out = df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            F.lit(event_type).alias("event_type"),
+            resolve_log_column(cols, field="rule_name", const=rule_name, column=rule_name_column).alias("rule_name"),
+            resolve_log_column(cols, field="message", const=message, column=message_column, required=True).alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(cols, field="case_id", const=None, column=case_id_column).alias("case_id"),
+            resolve_log_column(cols, field="collection_instance_id", const=collection_instance_id, column=collection_instance_id_column).alias("collection_instance_id"),
+            resolve_log_column(cols, field="variable_name", const=variable_name, column=variable_name_column).alias("variable_name"),
+            F.current_timestamp().alias("created_timestamp_utc"),
+        )
+        out = self._to_table_schema(out)
+        out.write.mode("append").format("delta").saveAsTable(self._table_path)
+        return out.count()  # one extra pass; drop if the caller never uses it
