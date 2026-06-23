@@ -1,0 +1,221 @@
+# exception_logger.py
+"""ExceptionLogger — writes Data Contract validation failures to the exceptions table.
+
+Raw observed values are never logged (PIA requirement); `expected` is used only
+to build a human-readable message, not stored as a column.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
+
+from pyspark.sql import functions as F
+
+from .base_logger import BaseLogger, resolve_log_column
+from .registry import load_registry
+from .table_resolver import ensure_logger_widgets, resolve_log_table_path
+from .violation import Violation
+
+_LOG_TABLE_ENV_VAR = "CENSUS_EXCEPTION_LOG_TABLE"
+_DEFAULT_BATCH_SIZE = 10000
+
+
+class ExceptionLogger(BaseLogger):
+    """Buffered writer for social_census_logs.exceptions. One instance per task."""
+
+    def __init__(self, spark, registry, table_path, run_id, task_key,
+                 batch_size=_DEFAULT_BATCH_SIZE):
+        super().__init__(
+            spark=spark, table_path=table_path, batch_size=batch_size,
+            run_id=run_id, task_key=task_key,
+        )
+        self._registry = registry
+
+    @classmethod
+    def for_task(
+        cls,
+        spark,
+        *,
+        run_id: str,
+        task_key: str,
+        log_table_path: Optional[str] = None,
+        registry_path=None,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "ExceptionLogger":
+        registry = load_registry(registry_path)
+        ensure_logger_widgets()
+        table = resolve_log_table_path(
+            dataset="exceptions",
+            explicit_table_path=log_table_path,
+            env_var_name=_LOG_TABLE_ENV_VAR,
+            widget_name="exception_log_table",
+        )
+        return cls(
+            spark=spark, registry=registry, table_path=table,
+            run_id=run_id, task_key=task_key, batch_size=batch_size,
+        )
+
+    def log(
+        self,
+        *,
+        rule: str,
+        event_type: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        expected: Any = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        message: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """Log one validation failure or technical exception."""
+        self._add_to_buffer(self._record(
+            rule=rule, event_type=event_type, source_table=source_table,
+            target_table=target_table, collection_instance_id=collection_instance_id,
+            variable_name=variable_name, expected=expected, response_id=response_id,
+            case_id=case_id, message=message, stack_trace=stack_trace,
+        ))
+
+    def log_many(
+        self,
+        violations: Iterable[Violation],
+        *,
+        event_type: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """Log several violations sharing response_id / case_id / event_type."""
+        for v in violations:
+            self._add_to_buffer(self._record(
+                rule=v.rule, event_type=event_type, source_table=source_table,
+                target_table=target_table, collection_instance_id=collection_instance_id,
+                variable_name=v.variable_name, expected=v.expected,
+                response_id=response_id, case_id=case_id, message=v.message,
+                stack_trace=stack_trace,
+            ))
+
+    def log_dataframe(
+        self,
+        df,
+        *,
+        event_type: str,
+        response_id_column: str,
+        rule: Optional[str] = None,
+        rule_column: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
+        expected: Any = None,
+        expected_column: Optional[str] = None,
+        case_id_column: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        collection_instance_id_column: Optional[str] = None,
+        message: Optional[str] = None,
+        message_column: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> int:
+        """Append one exception row per DataFrame row in a single distributed write."""
+        cols = df.columns
+        if response_id_column not in cols:
+            raise ValueError(f"response_id_column {response_id_column!r} not in {cols}")
+
+        df, rule_col, error_code, level, severity, blocking = \
+            self._governance_columns(df, rule, rule_column)
+
+        expected_col = resolve_log_column(cols, field="expected", const=expected, column=expected_column)
+        message_col = resolve_log_column(cols, field="message", const=message, column=message_column)
+        message_out = F.coalesce(message_col, self._default_message(rule_col, expected_col))
+
+        out = df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            level.alias("validation_level"),
+            F.lit(event_type).alias("event_type"),
+            error_code.alias("error_code"),
+            severity.alias("severity"),
+            message_out.alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(cols, field="case_id", const=None, column=case_id_column).alias("case_id"),
+            resolve_log_column(cols, field="collection_instance_id", const=collection_instance_id, column=collection_instance_id_column).alias("collection_instance_id"),
+            resolve_log_column(cols, field="variable_name", const=variable_name, column=variable_name_column).alias("variable_name"),
+            blocking.alias("is_blocking"),
+            F.lit(stack_trace).alias("stack_trace"),
+            F.current_timestamp().alias("created_timestamp_utc"),
+        )
+        out = self._to_table_schema(out)
+        out.write.mode("append").format("delta").saveAsTable(self._table_path)
+        return out.count()  # one extra pass; drop if the caller never uses it
+
+    def _governance_columns(self, df, rule, rule_column):
+        """Resolve rule(s) to governance columns; broadcast-join a lookup when per-row."""
+        if (rule is None) == (rule_column is None):
+            raise ValueError("Provide exactly one of `rule` or `rule_column`.")
+
+        if rule_column is not None:
+            if rule_column not in df.columns:
+                raise ValueError(f"rule_column {rule_column!r} not in {df.columns}")
+            rows = []
+            for rv in (r[0] for r in df.select(rule_column).distinct().collect()):
+                rc = self._registry.resolve(rv)
+                rows.append((rv, rc.error_code, rc.validation_level.value,
+                             rc.severity.value, rc.is_blocking))
+            lookup = self._spark.createDataFrame(
+                rows,
+                "_gov_rule string, _gov_error_code string, _gov_level string, "
+                "_gov_severity string, _gov_blocking boolean",
+            )
+            df = df.join(F.broadcast(lookup),
+                         F.col(rule_column) == F.col("_gov_rule"), "left")
+            return (df, F.col(rule_column), F.col("_gov_error_code"),
+                    F.col("_gov_level"), F.col("_gov_severity"), F.col("_gov_blocking"))
+
+        rc = self._registry.resolve(rule)
+        return (df, F.lit(rule), F.lit(rc.error_code),
+                F.lit(rc.validation_level.value), F.lit(rc.severity.value),
+                F.lit(rc.is_blocking))
+
+    @staticmethod
+    def _default_message(rule_col, expected_col):
+        rule_str = rule_col.cast("string")
+        base = F.concat(F.lit("Rule '"), rule_str, F.lit("' failed."))
+        with_expected = F.concat(F.lit("Rule '"), rule_str,
+                                 F.lit("' failed. Expected="), expected_col.cast("string"))
+        return F.when(expected_col.isNotNull(), with_expected).otherwise(base)
+
+    def _record(self, *, rule, event_type, source_table, target_table,
+                collection_instance_id, variable_name, expected, response_id,
+                case_id, message, stack_trace) -> dict:
+        resolved = self._registry.resolve(rule)
+        if message is None:
+            message = (f"Rule {rule!r} failed. Expected={expected!r}"
+                       if expected is not None else f"Rule {rule!r} failed.")
+        return {
+            **self._execution_fields(),
+            "id": str(uuid.uuid4()),
+            "source_table": source_table,
+            "target_table": target_table,
+            "validation_level": resolved.validation_level.value,
+            "event_type": event_type,
+            "error_code": resolved.error_code,
+            "severity": resolved.severity.value,
+            "message": message,
+            "response_id": response_id,
+            "case_id": case_id,
+            "collection_instance_id": collection_instance_id,
+            "variable_name": variable_name,
+            "is_blocking": resolved.is_blocking,
+            "stack_trace": stack_trace,
+            "created_timestamp_utc": datetime.now(timezone.utc),
+        }
