@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from config_models.collection_config import CollectionConfig
+from utils.props_resolver import (
+    ensure_props_widgets,
+    resolve_collection,
+    resolve_target,
+)
+
+
+def ensure_logger_widgets() -> None:
+    """Ensure standard logger widgets (target, collection) exist."""
+    ensure_props_widgets()
+
+
+def resolve_log_table_path(
+    *,
+    dataset: str,
+    explicit_table_path: Optional[str] = None,
+) -> str:
+    """Resolve a logger Delta table path.
+
+    Resolution order:
+      1. explicit_table_path
+      2. CollectionConfig(collection, target).get_table_path(dataset, "logs")
+    """
+    ensure_props_widgets()
+
+    if explicit_table_path:
+        return explicit_table_path
+
+    return CollectionConfig(
+        collection=resolve_collection(),
+        environment=resolve_target(),
+    ).get_table_path(dataset=dataset, steady_state="logs")
