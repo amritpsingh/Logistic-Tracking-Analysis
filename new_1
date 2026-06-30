@@ -1,533 +1,175 @@
-I have refactored the existing EventLogger and ExceptionLogger design (using Copilot) to make the logging module simpler, more explicit, and better aligned with the solution architect’s direction before building Pipeline Logging.
+I have made updated these files.
 
-1. Removed context.py dependency
-What changed
-Previously, both loggers used these from context.py:
 
-RunContext
-build_run_context()
+SPH_Survey_Data_Sourcing/src/utils/logger/base_logger.py
 
+"""BaseLogger — buffered writer shared by EventLogger and ExceptionLogger.
 
-That context included:
-run_id
-job_id
-task_key
-collection_instance_id
-source_table
-target_table
-
-We changed the design so that loggers no longer depend on context.py.
-Now, run_id and task_key are passed directly into the logger:
-ExceptionLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-)
-
-EventLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-)
-
-Purpose of change
-The solution architect’s direction is that job/run context should come from Databricks job parameters and be captured in the notebook, rather than being auto-discovered inside the logger.
-This makes identity propagation explicit:
-
-Databricks Job Parameters
-        ↓
-Notebook variables
-        ↓
-Logger constructor
-        ↓
-Log records
-
-Impact
-Positive impact
-
-Less hidden logic inside logger module.
-Easier to understand where run_id and task_key come from.
-Easier to test because the logger no longer depends on Databricks notebook internals.
-Better support for pipeline logging because run_id can be shared explicitly between:
-
-- PipelineRunLogger
-- EventLogger
-- ExceptionLogger
-
-
-
-Behaviour impact
-Existing code like this:
-ExceptionLogger.for_task(
-    spark=spark,
-    collection_instance_id="2027-CAS-001",
-    source_table="...",
-    target_table="...",
-)
-
-will need to change to:
-
-ExceptionLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-)
-
-
-
-2. Moved source_table and target_table out of context
-What changed
-Previously, source_table and target_table were passed when constructing the logger.
-Now they are passed at the individual log call level:
-
-logger.log(
-    event_type="coding",
-    message="Applied coding rule",
-    source_table="socpophousdata1_dev.social_census_parsed.individual",
-    target_table="socpophousdata1_dev.social_census_classified.individual",
-)
-
-For DataFrame logging:
-
-logger.log_dataframe(
-    failed_df,
-    rule="invalid_date_format",
-    event_type="DATACONTRACTVALIDATION",
-    source_table="socpophousdata1_dev.social_census_parsed.individual",
-    target_table="socpophousdata1_dev.social_census_validated.individual",
-    response_id_column="response_id",
-)
-
-
-Purpose of change
-A single notebook can contain multiple logical processing steps.
-For example:
-
-Step 1: ESS0 census_df      → ESS1 dwelling
-Step 2: ESS1 dwelling       → ESS2 dwelling validated
-Step 3: ESS2 dwelling       → ESS3 classified dwelling
-
-Each step can have a different source_table and target_table.
-So these values should not be stored as logger-level or run-level context.
-Impact
-Positive impact
-
-Supports multiple source/target pairs in one notebook.
-Avoids incorrect reuse of source/target values across unrelated logging calls.
-Makes each log record more accurate.
-Gives more flexibility for complex notebooks.
-
-Behaviour impact
-Callers must now supply source_table and target_table where needed.
-
-3. Moved collection_instance_id out of context
-What changed
-Previously, collection_instance_id was part of RunContext.
-Now it is passed:
-As a constant for a single log
-
-logger.log(
-    event_type="coding",
-    message="Applied coding rule",
-    collection_instance_id="2027-CAS-001",
-)
-
-Or from a DataFrame column
-
-logger.log_dataframe(
-    failed_df,
-    rule="invalid_date_format",
-    event_type="DATACONTRACTVALIDATION",
-    response_id_column="response_id",
-    collection_instance_id_column="collectionInstance",
-)
-
-
-
-Purpose of change
-collection_instance_id is data-level context, not run-level context.
-You mentioned it comes from the collectionInstance column in data tables. That means it may vary by row.
-Therefore, it should be supplied either:
-per log record
-
-or:
-per DataFrame row
-
-not stored once at logger construction time.
-Impact
-Positive impact
-
-Correctly supports row-level collectionInstance values.
-Avoids wrong collection instance being stamped across all records.
-Makes DataFrame-based logging more accurate.
-Aligns logging design with actual data model.
-
-
-4. Removed hardcoded _SCHEMA from loggers
-What changed
-Previously, event_logger.py and exception_logger.py both had large hardcoded Spark schemas.
-Example:
-
-_SCHEMA: StructType = StructType([
-    StructField("id", StringType(), False),
-    StructField("run_id", StringType(), False),
-    ...
-])
-
-
-We removed those schema definitions.
-Now BaseLogger reads the schema directly from the target Delta table:
-self._schema = self._spark.table(self._table_path).schema
-
-
-Purpose of change
-The log table schema is already defined in migration SQL:
-create_log_tables.sql
-
-
-So keeping the same schema again in Python creates duplication.
-The new design makes the Delta table the source of truth.
-Impact
-Positive impact
-
-Less duplicated code.
-Easier maintenance.
-If nullable columns are added to the table later, logger code may not need to change.
-Reduces risk of Python schema and Delta table schema drifting apart.
-Matches architect feedback that schema should come from the actual table.
-
-Behaviour impact
-The logger now requires the target Delta table to exist before construction.
-This is already aligned with your existing design principle:
-
-loggers do not auto-create tables
-tables are created by migration SQL
-
-
-5. Added strict schema alignment in BaseLogger
-What changed
-Before writing, each record is aligned to the actual Delta table schema.
-The new strict behaviour is:
-
-If the record contains a field that does not exist in the target table, raise an error.
-If the target table has a column missing from the record, fill it with None.
-Then create the DataFrame using the table schema.
-
-Conceptually:
-
-extra_fields = set(record.keys()) - set(table_schema_columns)
-
-if extra_fields:
-    raise ValueError(...)
-
-Then:
-
-aligned_record = {
-    field_name: record.get(field_name)
-    for field_name in table_schema_columns
-}
-
-
-Purpose of change
-This was chosen over a lightweight alignment approach because it is safer.
-It prevents bugs like this:
-"responseID": "P123"
-
-instead of:
-"response_id": "P123"
-
-
-Without strict validation, responseID would be silently ignored and response_id would become NULL.
-Impact
-Positive impact
-
-Prevents silent data quality issues in log records.
-Catches misspelled field names early.
-Protects log table integrity.
-Makes debugging easier because the logger fails with a clear message.
-
-Behaviour impact
-The logger is stricter than before.
-If a developer adds a field to a record dictionary that is not present in the Delta table, the write will fail.
-That is intentional.
-
-6. Simplified BaseLogger
-What changed
-BaseLogger now owns only common logger mechanics:
-
-- run_id
-- task_key
-- table path
-- Delta table schema loading
-- buffer
-- flush
-- strict schema alignment
-- context manager lifecycle
-- DataFrame size validation
-
-It no longer depends on:
-RunContext
-context.py
-subclass-defined _SCHEMA
-
-
-Purpose of change
-This makes BaseLogger more generic and reusable.
-It can now support:
-EventLogger
-ExceptionLogger
-future PipelineRunLogger
-
-without requiring separate hardcoded schemas.
-Impact
-Positive impact
-
-Cleaner base class.
-Less code in subclasses.
-Easier to add pipeline logging later.
-More consistent write behaviour across all logger types.
-
-
-7. Updated EventLogger
-What changed
-EventLogger now:
-
-requires run_id
-requires task_key
-gets table schema from the Delta table through BaseLogger
-accepts source_table, target_table, and collection_instance_id in log() and log_dataframe()
-
-Before:
-EventLogger.for_task(
-    spark=spark,
-    collection_instance_id="...",
-    source_table="...",
-    target_table="...",
-)
-
-After:
-EventLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-)
-
-Then:
-logger.log(
-    event_type="coding",
-    message="Applied rule",
-    source_table="...",
-    target_table="...",
-    collection_instance_id="...",
-)
-
-
-Purpose of change
-To make EventLogger focused on event logging only, while execution identity is passed explicitly and processing-specific values are supplied per event.
-Impact
-
-More flexible event logging.
-Better support for multiple logical steps in one notebook.
-Cleaner constructor.
-Less duplicated schema code.
-
-
-8. Updated ExceptionLogger
-What changed
-ExceptionLogger now:
-
-requires run_id
-requires task_key
-loads schema from the exceptions Delta table
-keeps registry-based rule resolution
-accepts source_table, target_table, and collection_instance_id at log-call level
-
-Before:
-ExceptionLogger.for_task(
-    spark=spark,
-    collection_instance_id="...",
-    source_table="...",
-    target_table="...",
-)
-
-After:
-ExceptionLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-)
-
-Then:
-logger.log(
-    rule="invalid_date_format",
-    event_type="DATACONTRACTVALIDATION",
-    source_table="...",
-    target_table="...",
-    collection_instance_id="...",
-    variable_name="date_of_birth",
-    expected="yyyy-mm-dd",
-    response_id="P123456789",
-)
-
-Purpose of change
-Exception logging needs to remain governance-driven via the registry, but it should not own execution context discovery or fixed source/target context.
-Impact
-
-Retains existing governance behaviour.
-Keeps error code registry unchanged.
-Allows per-step and per-row context.
-Prepares better for shared run_id with pipeline logging.
-
-
-9. Updated __init__.py
-What changed
-
-Removed exports for:
-RunContext
-build_run_context
-
-Kept exports for:
-ExceptionLogger
-EventLogger
-Violation
-ValidationLevel
-Severity
-load_registry
-RegistryLoadError
-TableContractError
-
-Purpose of change
-Since context.py is no longer part of the public API, it should not be exported from the logger package.
-Impact
-Consumers should no longer import:
-
-from utils.logger import RunContext, build_run_context
-
-Instead they should pass metadata explicitly:
-from utils.logger import ExceptionLogger, EventLogger
-
-
-10. Overall Design Before vs After
-Before
-
-Logger internally builds RunContext
-        ↓
-RunContext contains run_id, task_key, source_table, target_table, collection_instance_id
-        ↓
-Logger uses hardcoded Python _SCHEMA
-        ↓
-Writes records
-
-
-After
-
-Notebook receives Databricks job metadata
-        ↓
-Notebook passes run_id and task_key to logger
-        ↓
-source_table, target_table, collection_instance_id passed per log call
-        ↓
-BaseLogger reads schema from Delta table
-        ↓
-BaseLogger strictly validates/aligned records
-        ↓
-Writes records
-
-
-
-11. Main Benefits
-The refactor gives us:
-
-simpler logger architecture
-less duplicated code
-explicit run identity propagation
-better support for multi-step notebooks
-better support for row-level collectionInstance
-safer schema handling
-cleaner path toward PipelineRunLogger
-
-
-12. Main Impacts to Existing Notebooks
-Existing notebook code will need minor updates.
-
-Old pattern
-
-with ExceptionLogger.for_task(
-    spark=spark,
-    collection_instance_id="2027-CAS-001",
-    source_table=source_table,
-    target_table=target_table,
-) as logger:
-    logger.log(...)
-
-New pattern
-
-with ExceptionLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-) as logger:
-    logger.log(
-        source_table=source_table,
-        target_table=target_table,
-        collection_instance_id="2027-CAS-001",
-        ...
-    )
-
-For DataFrame logging, prefer:
-collection_instance_id_column="collectionInstance"
-
-when the value exists in the source data.
-
-
-
-
-
-
-
-
-
-Updated files:
-
-
-base_logger.py
-
-"""
-BaseLogger — shared buffering / flushing / lifecycle for structured loggers.
-
-This base class is intentionally table-schema-driven:
-- The target Delta table must already exist.
-- The logger reads the actual table schema at runtime.
-- Records are strictly aligned to the table schema before writing.
-- Extra record fields that do not exist in the target table raise an error.
-
-Subclasses own their public logging API and record construction only.
+The target Delta table must already exist (created by migration SQL). The
+logger reads its schema at runtime and aligns every record to it.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional, Tuple, Any
 
-from pyspark.sql import SparkSession
+from pyspark.sql import Column, SparkSession, functions as F
 from pyspark.sql.types import StructType
 
 log = logging.getLogger(__name__)
 
 
+class TableContractError(RuntimeError):
+    """Raised when the target log table is missing."""
+
+
+def resolve_log_column(
+    df_columns: List[str],
+    *,
+    field: str,
+    const,
+    column: Optional[str],
+    required: bool = False,
+) -> Column:
+    """Return a Spark Column for a field supplied as a constant or a df column."""
+    if const is not None and column is not None:
+        raise ValueError(f"Pass either `{field}` or `{field}_column`, not both.")
+    if required and const is None and column is None:
+        raise ValueError(f"Provide `{field}` or `{field}_column`.")
+    if column is not None:
+        if column not in df_columns:
+            raise ValueError(f"Column {column!r} not in DataFrame: {df_columns}")
+        return F.col(column)
+    return F.lit(const)
+
+
+def load_table_contract(
+    spark: SparkSession,
+    table_path: str,
+    *,
+    table_description: str = "Log table",
+) -> Tuple[StructType, List[str], set[str]]:
+    """
+    Validate that a table exists and load its schema contract.
+
+    Returns:
+        schema, schema_field_names, schema_field_name_set
+    """
+    if not spark.catalog.tableExists(table_path):
+        raise TableContractError(
+            f"{table_description} {table_path!r} does not exist; "
+            f"create it via SQL Script."
+        )
+
+    schema = spark.table(table_path).schema
+    schema_field_names = schema.fieldNames()
+    schema_field_name_set = set(schema_field_names)
+
+    return schema, schema_field_names, schema_field_name_set
+
+
+def align_record_to_schema(
+    record: dict,
+    *,
+    schema_field_names: List[str],
+    schema_field_name_set: set[str],
+    table_path: str,
+) -> dict:
+    """
+    Strictly align one record to a target table schema.
+
+    Behaviour:
+      - Rejects keys not present in the target table.
+      - Fills missing table columns with None.
+      - Orders values according to target table schema.
+    """
+    extra = set(record) - schema_field_name_set
+
+    if extra:
+        raise ValueError(
+            f"Record has field(s) not in {table_path!r}: {sorted(extra)}"
+        )
+
+    return {
+        field_name: record.get(field_name)
+        for field_name in schema_field_names
+    }
+
+
+def get_notebook_run_context() -> dict:
+    """
+    Databricks notebook/job run context reader and fallback helper only.
+
+    Notes:
+        - Preferred production pattern is still to pass job metadata from
+          Databricks job parameters into notebooks.
+        - In some Databricks access modes, notebook context access may be
+          unavailable. In that case, this function returns None values.
+    """
+    context = {
+        "run_id": None,
+        "job_id": None,
+        "job_name": None,
+        "trigger_type": None,
+        "start_time": None,
+        "end_time": None,
+        "task_key": None,
+        "task_run_id": None,
+        "parent_run_id": None,
+    }
+
+    def clean(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value if value else None
+
+    try:
+        from databricks.sdk.runtime import dbutils  # type: ignore[import-not-found]
+
+        ctx_json = dbutils.notebook.entry_point.getDbutils().notebook().getContext().toJson()
+        raw_context = json.loads(ctx_json)
+        tags = raw_context.get("tags", {}) or {}
+
+        current_run_id = raw_context.get("currentRunId")
+        if isinstance(current_run_id, dict):
+            context["run_id"] = clean(current_run_id.get("id"))
+        else:
+            context["run_id"] = clean(current_run_id)
+
+        context["run_id"] = (
+            context["run_id"]
+            or clean(tags.get("runId"))
+            or clean(tags.get("jobRunId"))
+        )
+
+        context["job_id"] = clean(tags.get("jobId"))
+        context["job_name"] = clean(tags.get("jobName"))
+        context["task_key"] = clean(tags.get("taskKey"))
+        context["task_run_id"] = clean(tags.get("idInJob"))
+        context["parent_run_id"] = clean(tags.get("parentRunId"))
+
+        context["trigger_type"] = (
+            clean(tags.get("triggerType"))
+            or clean(tags.get("jobTriggerType"))
+        )
+
+        start_timestamp_ms = clean(tags.get("startTimestamp"))
+        if start_timestamp_ms:
+            context["start_time"] = datetime.fromtimestamp(
+                int(start_timestamp_ms) / 1000,
+                tz=timezone.utc,
+            )
+
+    except Exception as exc:
+        log.debug("Databricks notebook run context unavailable: %s", exc)
+
+    return context
+
+
 class BaseLogger:
-    """
-    Buffered writer for structured log records into a Delta table.
-
-    Subclasses should:
-        - call super().__init__(...)
-        - build record dictionaries
-        - call self._add_to_buffer(record)
-
-    The schema is loaded from the actual target Delta table at runtime.
-    """
-
-    DATAFRAME_ROW_LIMIT: int = 100000
+    """Buffers structured records and appends them to a Delta log table."""
 
     def __init__(
         self,
@@ -537,245 +179,135 @@ class BaseLogger:
         run_id: str,
         task_key: str,
     ):
-        """
-        Initialise shared logger state.
-
-        Args:
-            spark: Active SparkSession.
-            table_path: Fully-qualified Delta table path.
-            batch_size: Records to buffer before auto-flush.
-            run_id: Pipeline/job run identifier passed from notebook/job metadata.
-            task_key: Databricks task key passed from notebook/job metadata.
-
-        Raises:
-            ValueError: if required inputs are missing or invalid.
-            TableContractError: if target table does not exist.
-        """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        
+        self._run_id = (
+            str(run_id).strip()
+            if run_id is not None and str(run_id).strip()
+            else "LOCAL_DEBUG"
+        )
 
-        if run_id is None or str(run_id).strip() == "":
-            raise ValueError("run_id is required and cannot be blank")
-
-        if task_key is None or str(task_key).strip() == "":
-            raise ValueError("task_key is required and cannot be blank")
+        self._task_key = (
+            str(task_key).strip()
+            if task_key is not None and str(task_key).strip()
+            else "LOCAL_DEBUG"
+        )
 
         self._spark = spark
         self._table_path = table_path
         self._batch_size = batch_size
-        self._run_id = str(run_id)
-        self._task_key = str(task_key)
         self._buffer: List[dict] = []
 
-        self._schema: StructType = self._load_table_schema()
-        self._schema_field_names: list[str] = self._schema.fieldNames()
-        self._schema_field_name_set: set[str] = set(self._schema_field_names)
-
-    # ────────────────────────────────────────────────────────
-    # Context manager protocol
-    # ────────────────────────────────────────────────────────
+        self._schema, self._schema_field_names, self._schema_field_name_set = (
+            load_table_contract(
+                spark=spark,
+                table_path=table_path,
+                table_description="Log table",
+            )
+        )
 
     def __enter__(self) -> "BaseLogger":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        """
-        Flush remaining buffered records on block exit.
-
-        If the caller's code raised and flush also fails, preserve the caller's
-        original exception and only log the flush failure.
-        """
+    def __exit__(self, exception_type, exception_value, traceback_obj) -> bool:
         try:
             self.flush()
         except Exception as flush_exc:
-            if exc_val is None:
+            if exception_value is None:
                 raise
-
-            log.error(
-                "Flush failed while exiting context manager for %s: %s",
-                self._table_path,
-                flush_exc,
-            )
-
+            log.error("Flush failed on exit for %s: %s", self._table_path, flush_exc)
         return False
 
-    # ────────────────────────────────────────────────────────
-    # Public API
-    # ────────────────────────────────────────────────────────
-
     def flush(self) -> None:
-        """
-        Append buffered records to the Delta table and clear the buffer.
-
-        The buffer is only cleared after a successful write.
-        """
+        """Append buffered records; the buffer is cleared only after a successful write."""
         if not self._buffer:
             return
-
         try:
-            aligned_records = [
-                self._align_record_to_table_schema(record)
-                for record in self._buffer
-            ]
-
-            df = self._spark.createDataFrame(
-                aligned_records,
-                schema=self._schema,
-            )
-
+            records = [self._align(r) for r in self._buffer]
+            df = self._spark.createDataFrame(records, schema=self._schema)
             df.write.mode("append").format("delta").saveAsTable(self._table_path)
-
         except Exception as exc:
             log.warning(
-                "Log flush failed for %s (%d record(s) retained): %s",
-                self._table_path,
-                len(self._buffer),
-                exc,
+                "Flush failed for %s (%d records retained): %s",
+                self._table_path, len(self._buffer), exc,
             )
             raise RuntimeError(
-                f"Failed to write {len(self._buffer)} log record(s) "
-                f"to {self._table_path}"
+                f"Failed to write {len(self._buffer)} record(s) to {self._table_path}"
             ) from exc
-
         self._buffer.clear()
 
     @property
     def buffer_size(self) -> int:
-        """Number of records currently buffered."""
         return len(self._buffer)
 
     @property
     def table_path(self) -> str:
-        """Fully-qualified target Delta table path."""
         return self._table_path
 
     @property
     def run_id(self) -> str:
-        """Pipeline/job run identifier used by this logger."""
         return self._run_id
 
     @property
     def task_key(self) -> str:
-        """Databricks task key used by this logger."""
         return self._task_key
 
-    # ────────────────────────────────────────────────────────
-    # Protected helpers for subclasses
-    # ────────────────────────────────────────────────────────
-
     def _add_to_buffer(self, record: dict) -> None:
-        """
-        Append a fully-assembled record to the buffer and auto-flush
-        when batch size is reached.
-        """
         self._buffer.append(record)
-
         if len(self._buffer) >= self._batch_size:
             self.flush()
 
     def _execution_fields(self) -> dict:
+        return {"run_id": self._run_id, "task_key": self._task_key}
+
+    def _to_table_schema(self, df):
         """
-        Return execution-level metadata shared by all log rows.
-
-        Processing-level fields such as source_table, target_table, and
-        collection_instance_id are intentionally not included here because
-        they may vary by logical step or by DataFrame row.
-        """
-        return {
-            "run_id": self._run_id,
-            "task_key": self._task_key,
-        }
-
-    def _validate_dataframe_size(self, df) -> int:
-        """
-        Confirm the DataFrame is small enough to safely collect to driver.
-
-        Returns:
-            Row count.
-
-        Raises:
-            ValueError: if the DataFrame exceeds the safety limit.
-        """
-        row_count = df.count()
-
-        if row_count > self.DATAFRAME_ROW_LIMIT:
-            raise ValueError(
-                f"DataFrame has {row_count:,} rows, exceeding the safety "
-                f"limit of {self.DATAFRAME_ROW_LIMIT:,}. Filter the input "
-                f"to actual failures/events, or split into smaller batches "
-                f"before calling log_dataframe()."
-            )
-
-        return row_count
-
-    # ────────────────────────────────────────────────────────
-    # Internal helpers
-    # ────────────────────────────────────────────────────────
-
-    def _load_table_schema(self) -> StructType:
-        """
-        Read schema from the target Delta table.
-
-        Raises:
-            TableContractError: if table does not exist.
-        """
-        if not self._spark.catalog.tableExists(self._table_path):
-            raise TableContractError(
-                f"Log table {self._table_path!r} does not exist. "
-                f"It must be pre-created by migration SQL."
-            )
-
-        return self._spark.table(self._table_path).schema
-
-    def _align_record_to_table_schema(self, record: dict) -> dict:
-        """
-        Strictly align a record dictionary to the target table schema.
+        Strictly align a DataFrame to the target table schema.
 
         Behaviour:
-            - Any extra field in the record that does not exist in the target
-              table raises ValueError.
-            - Any table column missing from the record is filled with None.
-              Delta/table constraints will reject invalid NULLs if applicable.
-
-        This protects against misspelled record keys being silently ignored.
+        - Reject columns not present in the target table.
+        - Fill missing target columns with NULL.
+        - Cast and order columns to match the target table.
         """
-        extra_fields = set(record.keys()) - self._schema_field_name_set
+        df_column_set = set(df.columns)
 
-        if extra_fields:
+        extra = df_column_set - self._schema_field_name_set
+        if extra:
             raise ValueError(
-                f"Record contains field(s) not present in target table "
-                f"{self._table_path!r}: {sorted(extra_fields)}"
+                f"DataFrame contains field(s) not present in target table "
+                f"{self._table_path!r}: {sorted(extra)}"
             )
 
-        return {
-            field_name: record.get(field_name)
-            for field_name in self._schema_field_names
-        }
+        aligned_cols = []
+
+        for field in self._schema.fields:
+            if field.name in df_column_set:
+                aligned_cols.append(
+                    F.col(field.name).cast(field.dataType).alias(field.name)
+                )
+            else:
+                aligned_cols.append(
+                    F.lit(None).cast(field.dataType).alias(field.name)
+                )
+
+        return df.select(*aligned_cols)
+
+    def _align(self, record: dict) -> dict:
+        return align_record_to_schema(
+            record,
+            schema_field_names=self._schema_field_names,
+            schema_field_name_set=self._schema_field_name_set,
+            table_path=self._table_path,
+        )
 
 
-class TableContractError(RuntimeError):
-    """
-    Raised when the target log Delta table is missing or unusable.
-    """
 
 
-
-
-event_logger.py
+SPH_Survey_Data_Sourcing/src/utils/logger/event_logger.py
 
 """
-EventLogger — structured writer for observation events into the events Delta table.
-
-Writes non-fatal informational events during processing, for example:
-- coding
-- MI_fix
-- edit
-- imputation
-- validation observation events
-
-The logger receives run_id and task_key explicitly from notebook/job metadata.
-Processing context such as source_table, target_table, and collection_instance_id
-is supplied at log-call level because it can vary within a notebook.
+EventLogger — writes non-fatal observation events to the events Delta table.
 """
 
 from __future__ import annotations
@@ -784,83 +316,36 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from .base_logger import BaseLogger
+from .base_logger import BaseLogger, resolve_log_column
 from .table_resolver import ensure_logger_widgets, resolve_log_table_path
 
-
-_LOG_TABLE_ENV_VAR = "CENSUS_EVENT_LOG_TABLE"
 _DEFAULT_BATCH_SIZE = 10000
 
 
 class EventLogger(BaseLogger):
-    """
-    Buffered writer for the social_census_logs.events Delta table.
-
-    Not thread-safe. Use one instance per task/notebook execution.
-    """
-
-    def __init__(
-        self,
-        spark: SparkSession,
-        table_path: str,
-        run_id: str,
-        task_key: str,
-        batch_size: int = _DEFAULT_BATCH_SIZE,
-    ):
-        super().__init__(
-            spark=spark,
-            table_path=table_path,
-            batch_size=batch_size,
-            run_id=run_id,
-            task_key=task_key,
-        )
-
-    # ────────────────────────────────────────────────────────
-    # Factory
-    # ────────────────────────────────────────────────────────
+    """Buffered writer for social_census_logs.events. One instance per task."""
 
     @classmethod
     def for_task(
         cls,
-        spark: SparkSession,
+        spark,
         *,
         run_id: str,
         task_key: str,
         log_table_path: Optional[str] = None,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> "EventLogger":
-        """
-        Build a fully-configured EventLogger for a single task.
-
-        Args:
-            spark: Active SparkSession.
-            run_id: Pipeline/job run ID passed from notebook/job metadata.
-            task_key: Databricks task key passed from notebook/job metadata.
-            log_table_path: Optional explicit events log table path.
-            batch_size: Records to buffer before auto-flush.
-        """
         ensure_logger_widgets()
-
-        resolved_table = resolve_log_table_path(
+        table = resolve_log_table_path(
             dataset="events",
             explicit_table_path=log_table_path,
-            env_var_name=_LOG_TABLE_ENV_VAR,
-            widget_name="event_log_table",
         )
-
         return cls(
-            spark=spark,
-            table_path=resolved_table,
-            run_id=run_id,
-            task_key=task_key,
-            batch_size=batch_size,
+            spark=spark, table_path=table, batch_size=batch_size,
+            run_id=run_id, task_key=task_key,
         )
-
-    # ────────────────────────────────────────────────────────
-    # Public API — single record
-    # ────────────────────────────────────────────────────────
 
     def log(
         self,
@@ -875,191 +360,8 @@ class EventLogger(BaseLogger):
         case_id: Optional[str] = None,
         variable_name: Optional[str] = None,
     ) -> None:
-        """
-        Log one observation event.
-
-        Args:
-            event_type: Event category, e.g. coding, MI_fix, edit, imputation.
-            message: Human-readable event message.
-            source_table: Source table for this logical step.
-            target_table: Target table for this logical step.
-            collection_instance_id: Collection instance for this event, if known.
-            rule_name: Optional business rule name.
-            response_id: Optional response identifier.
-            case_id: Optional case identifier.
-            variable_name: Optional variable involved in the event.
-        """
-        record = self._build_record(
-            event_type=event_type,
-            message=message,
-            source_table=source_table,
-            target_table=target_table,
-            collection_instance_id=collection_instance_id,
-            rule_name=rule_name,
-            response_id=response_id,
-            case_id=case_id,
-            variable_name=variable_name,
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        self._add_to_buffer(record)
-
-    # ────────────────────────────────────────────────────────
-    # Public API — DataFrame-based bulk logging
-    # ────────────────────────────────────────────────────────
-
-    def log_dataframe(
-        self,
-        df,
-        *,
-        event_type: str,
-        source_table: Optional[str] = None,
-        target_table: Optional[str] = None,
-        rule_name: Optional[str] = None,
-        rule_name_column: Optional[str] = None,
-        message: Optional[str] = None,
-        message_column: Optional[str] = None,
-        response_id_column: str,
-        case_id_column: Optional[str] = None,
-        collection_instance_id: Optional[str] = None,
-        collection_instance_id_column: Optional[str] = None,
-        variable_name: Optional[str] = None,
-        variable_name_column: Optional[str] = None,
-    ) -> int:
-        """
-        Log every row of a DataFrame as a separate event record.
-
-        Args:
-            df: PySpark DataFrame, one row per event.
-            event_type: Event category applied to every row.
-            source_table: Source table for this logical step.
-            target_table: Target table for this logical step.
-            rule_name: Constant rule name.
-            rule_name_column: Column containing per-row rule names.
-            message: Constant message.
-            message_column: Column containing per-row messages.
-            response_id_column: Column containing response IDs.
-            case_id_column: Optional column containing case IDs.
-            collection_instance_id: Constant collection instance ID.
-            collection_instance_id_column: Optional column containing per-row collection instance IDs.
-            variable_name: Constant variable name.
-            variable_name_column: Optional column containing per-row variable names.
-
-        Returns:
-            Number of event records added to the buffer.
-        """
-        if message is None and message_column is None:
-            raise ValueError(
-                "Either `message` or `message_column` must be supplied."
-            )
-
-        if message is not None and message_column is not None:
-            raise ValueError(
-                "Pass either `message` or `message_column`, not both."
-            )
-
-        if variable_name is not None and variable_name_column is not None:
-            raise ValueError(
-                "Pass either `variable_name` or `variable_name_column`, not both."
-            )
-
-        if rule_name is not None and rule_name_column is not None:
-            raise ValueError(
-                "Pass either `rule_name` or `rule_name_column`, not both."
-            )
-
-        if (
-            collection_instance_id is not None
-            and collection_instance_id_column is not None
-        ):
-            raise ValueError(
-                "Pass either `collection_instance_id` or "
-                "`collection_instance_id_column`, not both."
-            )
-
-        if response_id_column is None:
-            raise ValueError("`response_id_column` is required.")
-
-        for arg_name, col_name in [
-            ("message_column", message_column),
-            ("response_id_column", response_id_column),
-            ("case_id_column", case_id_column),
-            ("collection_instance_id_column", collection_instance_id_column),
-            ("variable_name_column", variable_name_column),
-            ("rule_name_column", rule_name_column),
-        ]:
-            if col_name is not None and col_name not in df.columns:
-                raise ValueError(
-                    f"Column {col_name!r} passed as {arg_name} not found. "
-                    f"Available columns: {df.columns}"
-                )
-
-        row_count = self._validate_dataframe_size(df)
-
-        if row_count == 0:
-            return 0
-
-        timestamp = datetime.now(timezone.utc)
-
-        for row in df.collect():
-            row_dict = row.asDict()
-
-            record = self._build_record(
-                event_type=event_type,
-                message=(
-                    row_dict[message_column]
-                    if message_column
-                    else message
-                ),
-                source_table=source_table,
-                target_table=target_table,
-                collection_instance_id=(
-                    row_dict[collection_instance_id_column]
-                    if collection_instance_id_column
-                    else collection_instance_id
-                ),
-                rule_name=(
-                    row_dict[rule_name_column]
-                    if rule_name_column
-                    else rule_name
-                ),
-                response_id=row_dict[response_id_column],
-                case_id=(
-                    row_dict[case_id_column]
-                    if case_id_column
-                    else None
-                ),
-                variable_name=(
-                    row_dict[variable_name_column]
-                    if variable_name_column
-                    else variable_name
-                ),
-                timestamp=timestamp,
-            )
-
-            self._add_to_buffer(record)
-
-        return row_count
-
-    # ────────────────────────────────────────────────────────
-    # Internal — record assembly
-    # ────────────────────────────────────────────────────────
-
-    def _build_record(
-        self,
-        *,
-        event_type: str,
-        message: str,
-        source_table: Optional[str],
-        target_table: Optional[str],
-        collection_instance_id: Optional[str],
-        rule_name: Optional[str],
-        response_id: Optional[str],
-        case_id: Optional[str],
-        variable_name: Optional[str],
-        timestamp: datetime,
-    ) -> dict:
-        return {
+        """Log one observation event."""
+        self._add_to_buffer({
             **self._execution_fields(),
             "id": str(uuid.uuid4()),
             "source_table": source_table,
@@ -1071,137 +373,113 @@ class EventLogger(BaseLogger):
             "case_id": case_id,
             "collection_instance_id": collection_instance_id,
             "variable_name": variable_name,
-            "created_timestamp_utc": timestamp,
-        }
+            "created_timestamp_utc": datetime.now(timezone.utc),
+        })
+
+    def log_dataframe(
+        self,
+        df,
+        *,
+        event_type: str,
+        response_id_column: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        message: Optional[str] = None,
+        message_column: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        rule_name_column: Optional[str] = None,
+        case_id_column: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        collection_instance_id_column: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
+    ) -> None:
+        """Append one event row per DataFrame row in a single distributed write."""
+        
+        self.flush()
+        
+        cols = df.columns
+        if response_id_column not in cols:
+            raise ValueError(f"response_id_column {response_id_column!r} not in {cols}")
+
+        out = df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            F.lit(event_type).alias("event_type"),
+            resolve_log_column(cols, field="rule_name", const=rule_name, column=rule_name_column).alias("rule_name"),
+            resolve_log_column(cols, field="message", const=message, column=message_column, required=True).alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(cols, field="case_id", const=None, column=case_id_column).alias("case_id"),
+            resolve_log_column(cols, field="collection_instance_id", const=collection_instance_id, column=collection_instance_id_column).alias("collection_instance_id"),
+            resolve_log_column(cols, field="variable_name", const=variable_name, column=variable_name_column).alias("variable_name"),
+            F.current_timestamp().alias("created_timestamp_utc"),
+        )
+        out = self._to_table_schema(out)
+        out.write.mode("append").format("delta").saveAsTable(self._table_path)
 
 
 
 
-exception_logger.py
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/logger/exception_logger.py
 
 """
-ExceptionLogger — structured writer for Data Contract Technical Validation
-failures and technical exceptions into the exceptions Delta table.
-
-The logger receives run_id and task_key explicitly from notebook/job metadata.
-Processing context such as source_table, target_table, and collection_instance_id
-is supplied at log-call level because it can vary within a notebook and even
-per DataFrame row.
+ExceptionLogger — writes Data Contract validation failures to the exceptions table.
 """
 
 from __future__ import annotations
 
-import json
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Optional
 
-from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from .base_logger import BaseLogger
-from .registry import (
-    ErrorCodeRegistry,
-    ResolvedCode,
-    load_registry,
-)
+from .base_logger import BaseLogger, resolve_log_column
+from .registry import load_registry
 from .table_resolver import ensure_logger_widgets, resolve_log_table_path
 from .violation import Violation
 
-
-_LOG_TABLE_ENV_VAR = "CENSUS_EXCEPTION_LOG_TABLE"
 _DEFAULT_BATCH_SIZE = 10000
 
 
-def _to_loggable(value: Any) -> Optional"""
-    Convert an expected value into a readable string for message generation.
-
-    The expected value is not stored as a separate column.
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, (bool, int, float, str)):
-        return str(value)
-
-    return json.dumps(value, default=str)
-
-
 class ExceptionLogger(BaseLogger):
-    """
-    Buffered writer for the social_census_logs.exceptions Delta table.
+    """Buffered writer for social_census_logs.exceptions. One instance per task."""
 
-    Not thread-safe. Use one instance per task/notebook execution.
-    """
-
-    def __init__(
-        self,
-        spark: SparkSession,
-        registry: ErrorCodeRegistry,
-        table_path: str,
-        run_id: str,
-        task_key: str,
-        batch_size: int = _DEFAULT_BATCH_SIZE,
-    ):
+    def __init__(self, spark, registry, table_path, run_id, task_key,
+                 batch_size=_DEFAULT_BATCH_SIZE):
         super().__init__(
-            spark=spark,
-            table_path=table_path,
-            batch_size=batch_size,
-            run_id=run_id,
-            task_key=task_key,
+            spark=spark, table_path=table_path, batch_size=batch_size,
+            run_id=run_id, task_key=task_key,
         )
-
         self._registry = registry
-
-    # ────────────────────────────────────────────────────────
-    # Factory
-    # ────────────────────────────────────────────────────────
 
     @classmethod
     def for_task(
         cls,
-        spark: SparkSession,
+        spark,
         *,
         run_id: str,
         task_key: str,
         log_table_path: Optional[str] = None,
-        registry_path: Optional[Union[str, Path]] = None,
+        registry_path=None,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> "ExceptionLogger":
-        """
-        Build a fully-configured ExceptionLogger for a single task.
-
-        Args:
-            spark: Active SparkSession.
-            run_id: Pipeline/job run ID passed from notebook/job metadata.
-            task_key: Databricks task key passed from notebook/job metadata.
-            log_table_path: Optional explicit exceptions log table path.
-            registry_path: Optional path to error code registry YAML.
-            batch_size: Records to buffer before auto-flush.
-        """
         registry = load_registry(registry_path)
-
         ensure_logger_widgets()
-
-        resolved_table = resolve_log_table_path(
+        table = resolve_log_table_path(
             dataset="exceptions",
             explicit_table_path=log_table_path,
-            env_var_name=_LOG_TABLE_ENV_VAR,
-            widget_name="exception_log_table",
         )
-
         return cls(
-            spark=spark,
-            registry=registry,
-            table_path=resolved_table,
-            run_id=run_id,
-            task_key=task_key,
-            batch_size=batch_size,
+            spark=spark, registry=registry, table_path=table,
+            run_id=run_id, task_key=task_key, batch_size=batch_size,
         )
-
-    # ────────────────────────────────────────────────────────
-    # Public API — single record
-    # ────────────────────────────────────────────────────────
 
     def log(
         self,
@@ -1218,45 +496,13 @@ class ExceptionLogger(BaseLogger):
         message: Optional[str] = None,
         stack_trace: Optional[str] = None,
     ) -> None:
-        """
-        Log one validation failure or technical exception.
-
-        Args:
-            rule: Validation rule key registered in error_codes.yml.
-            event_type: Event category, e.g. DATACONTRACTVALIDATION.
-            source_table: Source table for this logical step.
-            target_table: Target table for this logical step.
-            collection_instance_id: Collection instance for this exception, if known.
-            variable_name: Variable involved in the failure, if applicable.
-            expected: Expected value/pattern used for message generation only.
-            response_id: Optional response identifier.
-            case_id: Optional case identifier.
-            message: Optional custom message.
-            stack_trace: Optional traceback string.
-        """
-        resolved = self._registry.resolve(rule)
-
-        record = self._build_record(
-            resolved=resolved,
-            event_type=event_type,
-            rule=rule,
-            source_table=source_table,
-            target_table=target_table,
-            collection_instance_id=collection_instance_id,
-            variable_name=variable_name,
-            expected=expected,
-            response_id=response_id,
-            case_id=case_id,
-            message=message,
-            stack_trace=stack_trace,
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        self._add_to_buffer(record)
-
-    # ────────────────────────────────────────────────────────
-    # Public API — multiple violations for one logical record
-    # ────────────────────────────────────────────────────────
+        """Log one validation failure or technical exception."""
+        self._add_to_buffer(self._record(
+            rule=rule, event_type=event_type, source_table=source_table,
+            target_table=target_table, collection_instance_id=collection_instance_id,
+            variable_name=variable_name, expected=expected, response_id=response_id,
+            case_id=case_id, message=message, stack_trace=stack_trace,
+        ))
 
     def log_many(
         self,
@@ -1270,222 +516,117 @@ class ExceptionLogger(BaseLogger):
         case_id: Optional[str] = None,
         stack_trace: Optional[str] = None,
     ) -> None:
-        """
-        Log many violations that share response_id, case_id, and event_type.
-        """
-        timestamp = datetime.now(timezone.utc)
-
-        for violation in list(violations):
-            resolved = self._registry.resolve(violation.rule)
-
-            record = self._build_record(
-                resolved=resolved,
-                event_type=event_type,
-                rule=violation.rule,
-                source_table=source_table,
-                target_table=target_table,
-                collection_instance_id=collection_instance_id,
-                variable_name=violation.variable_name,
-                expected=violation.expected,
-                response_id=response_id,
-                case_id=case_id,
-                message=violation.message,
+        """Log several violations sharing response_id / case_id / event_type."""
+        for v in violations:
+            self._add_to_buffer(self._record(
+                rule=v.rule, event_type=event_type, source_table=source_table,
+                target_table=target_table, collection_instance_id=collection_instance_id,
+                variable_name=v.variable_name, expected=v.expected,
+                response_id=response_id, case_id=case_id, message=v.message,
                 stack_trace=stack_trace,
-                timestamp=timestamp,
-            )
-
-            self._add_to_buffer(record)
-
-    # ────────────────────────────────────────────────────────
-    # Public API — DataFrame-based bulk logging
-    # ────────────────────────────────────────────────────────
+            ))
 
     def log_dataframe(
         self,
         df,
         *,
+        event_type: str,
+        response_id_column: str,
         rule: Optional[str] = None,
         rule_column: Optional[str] = None,
-        event_type: str,
         source_table: Optional[str] = None,
         target_table: Optional[str] = None,
         variable_name: Optional[str] = None,
         variable_name_column: Optional[str] = None,
         expected: Any = None,
         expected_column: Optional[str] = None,
-        response_id_column: str,
         case_id_column: Optional[str] = None,
         collection_instance_id: Optional[str] = None,
         collection_instance_id_column: Optional[str] = None,
         message: Optional[str] = None,
         message_column: Optional[str] = None,
         stack_trace: Optional[str] = None,
-    ) -> int:
-        """
-        Log every row of a DataFrame as a separate exception record.
+    ) -> None:
+        """Append one exception row per DataFrame row in a single distributed write."""
 
-        Args:
-            df: PySpark DataFrame containing one row per failure.
-            rule: Constant validation rule key.
-            rule_column: Column containing per-row rule keys.
-            event_type: Event category applied to every row.
-            source_table: Source table for this logical step.
-            target_table: Target table for this logical step.
-            variable_name: Constant variable name.
-            variable_name_column: Column containing per-row variable names.
-            expected: Constant expected value used for message generation.
-            expected_column: Column containing per-row expected values.
-            response_id_column: Column containing response IDs.
-            case_id_column: Optional column containing case IDs.
-            collection_instance_id: Constant collection instance ID.
-            collection_instance_id_column: Optional column containing per-row collection instance IDs.
-            message: Constant custom message.
-            message_column: Column containing per-row custom messages.
-            stack_trace: Optional constant stack trace.
+        self.flush()
 
-        Returns:
-            Number of exception records added to the buffer.
-        """
-        if rule is None and rule_column is None:
-            raise ValueError(
-                "Either `rule` or `rule_column` must be supplied."
+        cols = df.columns
+        if response_id_column not in cols:
+            raise ValueError(f"response_id_column {response_id_column!r} not in {cols}")
+
+        df, rule_col, error_code, level, severity, blocking = \
+            self._governance_columns(df, rule, rule_column)
+
+        expected_col = resolve_log_column(cols, field="expected", const=expected, column=expected_column)
+        message_col = resolve_log_column(cols, field="message", const=message, column=message_column)
+        message_out = F.coalesce(message_col, self._default_message(rule_col, expected_col))
+
+        out = df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            level.alias("validation_level"),
+            F.lit(event_type).alias("event_type"),
+            error_code.alias("error_code"),
+            severity.alias("severity"),
+            message_out.alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(cols, field="case_id", const=None, column=case_id_column).alias("case_id"),
+            resolve_log_column(cols, field="collection_instance_id", const=collection_instance_id, column=collection_instance_id_column).alias("collection_instance_id"),
+            resolve_log_column(cols, field="variable_name", const=variable_name, column=variable_name_column).alias("variable_name"),
+            blocking.alias("is_blocking"),
+            F.lit(stack_trace).alias("stack_trace"),
+            F.current_timestamp().alias("created_timestamp_utc"),
+        )
+        out = self._to_table_schema(out)
+        out.write.mode("append").format("delta").saveAsTable(self._table_path)
+
+    def _governance_columns(self, df, rule, rule_column):
+        """Resolve rule(s) to governance columns; broadcast-join a lookup when per-row."""
+        if (rule is None) == (rule_column is None):
+            raise ValueError("Provide exactly one of `rule` or `rule_column`.")
+
+        if rule_column is not None:
+            if rule_column not in df.columns:
+                raise ValueError(f"rule_column {rule_column!r} not in {df.columns}")
+            rows = []
+            for rv in (r[0] for r in df.select(rule_column).distinct().collect()):
+                rc = self._registry.resolve(rv)
+                rows.append((rv, rc.error_code, rc.validation_level.value,
+                             rc.severity.value, rc.is_blocking))
+            lookup = self._spark.createDataFrame(
+                rows,
+                "_gov_rule string, _gov_error_code string, _gov_level string, "
+                "_gov_severity string, _gov_blocking boolean",
             )
+            df = df.join(F.broadcast(lookup),
+                         F.col(rule_column) == F.col("_gov_rule"), "left")
+            return (df, F.col(rule_column), F.col("_gov_error_code"),
+                    F.col("_gov_level"), F.col("_gov_severity"), F.col("_gov_blocking"))
 
-        if rule is not None and rule_column is not None:
-            raise ValueError(
-                "Pass either `rule` or `rule_column`, not both."
-            )
+        rc = self._registry.resolve(rule)
+        return (df, F.lit(rule), F.lit(rc.error_code),
+                F.lit(rc.validation_level.value), F.lit(rc.severity.value),
+                F.lit(rc.is_blocking))
 
-        if variable_name is not None and variable_name_column is not None:
-            raise ValueError(
-                "Pass either `variable_name` or `variable_name_column`, not both."
-            )
+    @staticmethod
+    def _default_message(rule_col, expected_col):
+        rule_str = rule_col.cast("string")
+        base = F.concat(F.lit("Rule '"), rule_str, F.lit("' failed."))
+        with_expected = F.concat(F.lit("Rule '"), rule_str,
+                                 F.lit("' failed. Expected="), expected_col.cast("string"))
+        return F.when(expected_col.isNotNull(), with_expected).otherwise(base)
 
-        if expected is not None and expected_column is not None:
-            raise ValueError(
-                "Pass either `expected` or `expected_column`, not both."
-            )
-
-        if message is not None and message_column is not None:
-            raise ValueError(
-                "Pass either `message` or `message_column`, not both."
-            )
-
-        if (
-            collection_instance_id is not None
-            and collection_instance_id_column is not None
-        ):
-            raise ValueError(
-                "Pass either `collection_instance_id` or "
-                "`collection_instance_id_column`, not both."
-            )
-
-        if response_id_column is None:
-            raise ValueError("`response_id_column` is required.")
-
-        for arg_name, col_name in [
-            ("rule_column", rule_column),
-            ("message_column", message_column),
-            ("response_id_column", response_id_column),
-            ("case_id_column", case_id_column),
-            ("variable_name_column", variable_name_column),
-            ("expected_column", expected_column),
-            ("collection_instance_id_column", collection_instance_id_column),
-        ]:
-            if col_name is not None and col_name not in df.columns:
-                raise ValueError(
-                    f"Column {col_name!r} passed as {arg_name} not found. "
-                    f"Available columns: {df.columns}"
-                )
-
-        row_count = self._validate_dataframe_size(df)
-
-        if row_count == 0:
-            return 0
-
-        timestamp = datetime.now(timezone.utc)
-        resolved_cache: dict[str, ResolvedCode] = {}
-
-        for row in df.collect():
-            row_dict = row.asDict()
-
-            rule_value = row_dict[rule_column] if rule_column else rule
-            expected_value = (
-                row_dict[expected_column]
-                if expected_column
-                else expected
-            )
-
-            if rule_value not in resolved_cache:
-                resolved_cache[rule_value] = self._registry.resolve(rule_value)
-
-            resolved = resolved_cache[rule_value]
-
-            record = self._build_record(
-                resolved=resolved,
-                event_type=event_type,
-                rule=rule_value,
-                source_table=source_table,
-                target_table=target_table,
-                collection_instance_id=(
-                    row_dict[collection_instance_id_column]
-                    if collection_instance_id_column
-                    else collection_instance_id
-                ),
-                variable_name=(
-                    row_dict[variable_name_column]
-                    if variable_name_column
-                    else variable_name
-                ),
-                expected=expected_value,
-                response_id=row_dict[response_id_column],
-                case_id=(
-                    row_dict[case_id_column]
-                    if case_id_column
-                    else None
-                ),
-                message=(
-                    row_dict[message_column]
-                    if message_column
-                    else message
-                ),
-                stack_trace=stack_trace,
-                timestamp=timestamp,
-            )
-
-            self._add_to_buffer(record)
-
-        return row_count
-
-    # ────────────────────────────────────────────────────────
-    # Internal — record assembly
-    # ────────────────────────────────────────────────────────
-
-    def _build_record(
-        self,
-        *,
-        resolved: ResolvedCode,
-        event_type: str,
-        rule: str,
-        source_table: Optional[str],
-        target_table: Optional[str],
-        collection_instance_id: Optional[str],
-        variable_name: Optional[str],
-        expected: Any,
-        response_id: Optional[str],
-        case_id: Optional[str],
-        message: Optional[str],
-        stack_trace: Optional[str],
-        timestamp: datetime,
-    ) -> dict:
-        expected_str = _to_loggable(expected)
-
+    def _record(self, *, rule, event_type, source_table, target_table,
+                collection_instance_id, variable_name, expected, response_id,
+                case_id, message, stack_trace) -> dict:
+        resolved = self._registry.resolve(rule)
         if message is None:
-            if expected_str is not None:
-                message = f"Rule '{rule}' failed. Expected={expected_str!r}"
-            else:
-                message = f"Rule '{rule}' failed."
-
+            message = (f"Rule {rule!r} failed. Expected={expected!r}"
+                       if expected is not None else f"Rule {rule!r} failed.")
         return {
             **self._execution_fields(),
             "id": str(uuid.uuid4()),
@@ -1502,12 +643,241 @@ class ExceptionLogger(BaseLogger):
             "variable_name": variable_name,
             "is_blocking": resolved.is_blocking,
             "stack_trace": stack_trace,
-            "created_timestamp_utc": timestamp,
+            "created_timestamp_utc": datetime.now(timezone.utc),
         }
 
 
 
-__init__.py
+
+SPH_Survey_Data_Sourcing/src/utils/logger/table_resolver.py
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from config_models.collection_config import CollectionConfig
+from utils.props_resolver import (
+    DEFAULT_COLLECTION,
+    DEFAULT_TARGET,
+    create_widget_if_missing,
+    get_widget_value,
+    resolve_collection,
+    resolve_target,
+)
+
+def ensure_logger_widgets() -> None:
+    """
+    Ensure standard logger widgets exist.
+
+    This mirrors the behaviour of the parsing notebooks/settings module:
+      - target defaults to dev
+      - collection defaults to social_census
+
+    Called by logger factories so users see the same widgets when using
+    ExceptionLogger/EventLogger in notebooks.
+    """
+    create_widget_if_missing("target", DEFAULT_TARGET)
+    create_widget_if_missing("collection", DEFAULT_COLLECTION)
+
+
+def resolve_log_table_path(
+    *,
+    dataset: str,
+    explicit_table_path: Optional[str] = None,
+) -> str:
+    """
+    Resolve a logger Delta table path.
+
+    Resolution order:
+      1. explicit_table_path argument
+      2. CollectionConfig(collection, target).get_table_path(dataset, "logs")
+    """
+    ensure_logger_widgets()
+
+    if explicit_table_path:
+        return explicit_table_path
+
+    target = resolve_target()
+    collection = resolve_collection()
+
+    return CollectionConfig(
+        collection=collection,
+        environment=target,
+    ).get_table_path(
+        dataset=dataset,
+        steady_state="logs",
+    )
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/props_resolver.py
+
+
+from __future__ import annotations
+
+import os
+from typing import Optional, Union
+
+from config_models.collection_config import Collection
+
+
+DEFAULT_TARGET = "dev"
+DEFAULT_COLLECTION = Collection.social_census.value
+
+
+def get_dbutils():
+    """
+    Return Databricks dbutils when available, otherwise None.
+
+    This keeps resolvers usable in:
+      - Databricks notebooks
+      - Databricks Jobs
+      - local/unit-test contexts where dbutils is unavailable
+    """
+    try:
+        from databricks.sdk.runtime import dbutils  # type: ignore[import-not-found]
+
+        return dbutils
+    except Exception:
+        return None
+
+
+def get_widget_value(name: str) -> Optional[str]:
+    """
+    Safely read a Databricks widget value.
+
+    Returns None when:
+      - not running in Databricks
+      - dbutils is unavailable
+      - widget does not exist
+      - widget value is blank
+    """
+    dbutils = get_dbutils()
+    if dbutils is None:
+        return None
+
+    try:
+        value = dbutils.widgets.get(name)
+    except Exception:
+        return None
+
+    if value is None or str(value).strip() == "":
+        return None
+
+    return str(value).strip()
+
+
+def create_widget_if_missing(name: str, default_value: str) -> None:
+    """
+    Create a Databricks text widget if it does not already exist.
+
+    If the widget already exists, this function leaves it unchanged.
+    This is important for Databricks Jobs, where job parameters are already
+    materialised as widgets before notebook code runs.
+    """
+    dbutils = get_dbutils()
+    if dbutils is None:
+        return
+
+    try:
+        # If this succeeds, widget already exists. Do not overwrite it.
+        dbutils.widgets.get(name)
+        return
+    except Exception:
+        pass
+
+    try:
+        dbutils.widgets.text(name, default_value)
+    except Exception:
+        # Do not make widget creation fatal. Resolver can still fall back to
+        # environment variables or defaults.
+        return
+
+
+def ensure_props_widgets() -> None:
+    """
+    Ensure standard runtime property widgets exist.
+
+    This mirrors parsing notebook defaults:
+      - target defaults to dev
+      - collection defaults to social_census
+    """
+    create_widget_if_missing("target", DEFAULT_TARGET)
+    create_widget_if_missing("collection", DEFAULT_COLLECTION)
+
+
+def _coerce_collection(collection: Union[str, Collection]) -> Collection:
+    """
+    Convert a collection value into a Collection enum.
+
+    Supports:
+      - Collection.social_census
+      - "social_census"
+      - "config_test_survey"
+      - "census_strawman"
+    """
+    if isinstance(collection, Collection):
+        return collection
+
+    try:
+        return Collection(collection)
+    except ValueError:
+        try:
+            return Collection[collection]
+        except KeyError:
+            valid = ", ".join(c.value for c in Collection)
+            raise ValueError(
+                f"Invalid collection {collection!r}. Valid values are: {valid}"
+            ) from None
+
+
+def resolve_target() -> str:
+    """
+    Resolve target environment.
+
+    Resolution order:
+      1. Databricks widget: target
+      2. Databricks widget: Target
+      3. Environment variable: CENSUS_TARGET
+      4. Default: dev
+    """
+    ensure_props_widgets()
+
+    return (
+        get_widget_value("target")
+        or get_widget_value("Target")
+        or os.environ.get("CENSUS_TARGET")
+        or DEFAULT_TARGET
+    )
+
+
+def resolve_collection() -> Collection:
+    """
+    Resolve collection namespace.
+
+    Resolution order:
+      1. Databricks widget: collection
+      2. Databricks widget: Collection
+      3. Environment variable: CENSUS_COLLECTION
+      4. Default: social_census
+    """
+    ensure_props_widgets()
+
+    resolved = (
+        get_widget_value("collection")
+        or get_widget_value("Collection")
+        or os.environ.get("CENSUS_COLLECTION")
+        or DEFAULT_COLLECTION
+    )
+
+    return _coerce_collection(resolved)
+
+
+
+
+SPH_Survey_Data_Sourcing/src/utils/logger/__init__.py
+
 
 """
 Structured logging for Data Contract Technical Validation failures and other
@@ -1518,22 +888,56 @@ Public API:
     ExceptionLogger       — buffered writer for the exceptions Delta table
     EventLogger           — buffered writer for the events Delta table
     Violation             — dataclass for bulk-logging validation failures
+    RunContext            — immutable per-task context (usually built automatically)
+    build_run_context     — factory for RunContext, with Databricks job integration
     ValidationLevel       — FILE / RECORD / FIELD / VALUE enum
     Severity              — ERROR / WARNING / INFO enum
     load_registry         — cached loader for the error code registry YAML
     RegistryLoadError     — raised on registry load/validate failure
-    TableContractError    — raised when target log table is missing
+    TableContractError    — raised on table-contract mismatch at logger construction
 
-Notes:
-    - run_id and task_key should be passed explicitly from Databricks
-      job/task parameters into notebooks, then into loggers.
-    - source_table, target_table, and collection_instance_id are supplied
-      at log-call level because they may vary by logical step or row.
+Typical use — ExceptionLogger (validation failures):
+
+    from utils.logger import ExceptionLogger
+
+    with ExceptionLogger.for_task(
+        spark=spark,
+        collection_instance_id="2027-CAS-001",
+        source_table="socpophousdata1_dev.social_census_parsed.individual",
+        target_table="socpophousdata1_dev.social_census_validated.individual",
+    ) as logger:
+        logger.log(
+            rule="invalid_date_format",
+            event_type="DATACONTRACTVALIDATION",
+            variable_name="date_of_birth",
+            expected="yyyy-mm-dd",
+            response_id="P123456789",
+        )
+
+Typical use — EventLogger (informational events):
+
+    from utils.logger import EventLogger
+
+    with EventLogger.for_task(
+        spark=spark,
+        collection_instance_id="2027-CAS-001",
+        source_table="socpophousdata1_dev.social_census_parsed.individual",
+        target_table="socpophousdata1_dev.social_census_classified.individual",
+    ) as logger:
+        logger.log(
+            event_type="coding",
+            message="Applied ethnic group coding rules successfully",
+            rule_name="ethnic_group_coding_v1",
+            response_id="P12345",
+            variable_name="ethnic_group",
+        )
 """
 
 from .base_logger import TableContractError
+from .context import RunContext, build_run_context
 from .event_logger import EventLogger
 from .exception_logger import ExceptionLogger
+from .pipeline_logger import PipelineLogger
 from .registry import (
     RegistryLoadError,
     load_registry,
@@ -1542,9 +946,12 @@ from .schema import Severity, ValidationLevel
 from .violation import Violation
 
 __all__ = [
+    "PipelineLogger",
     "ExceptionLogger",
     "EventLogger",
     "Violation",
+    "RunContext",
+    "build_run_context",
     "ValidationLevel",
     "Severity",
     "load_registry",
@@ -1554,60 +961,6 @@ __all__ = [
 
 
 
-Usage after refactor
-
-Single event
-
-from utils.logger import EventLogger
-
-with EventLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-) as logger:
-    logger.log(
-        event_type="coding",
-        message="Applied ethnic group coding rules successfully",
-        source_table="socpophousdata1_dev.social_census_parsed.individual",
-        target_table="socpophousdata1_dev.social_census_classified.individual",
-        collection_instance_id="2027-CAS-001",
-        rule_name="ethnic_group_coding_v1",
-        response_id="P12345",
-        case_id="500Mp00000d56UCIAY",
-        variable_name="ethnic_group",
-    )
 
 
-Single exception
 
-from utils.logger import ExceptionLogger
-
-with ExceptionLogger.for_task(
-    spark=spark,
-    run_id=job_metadata["job_run_id"],
-    task_key=job_metadata["task_key"],
-) as logger:
-    logger.log(
-        rule="invalid_date_format",
-        event_type="DATACONTRACTVALIDATION",
-        source_table="socpophousdata1_dev.social_census_parsed.individual",
-        target_table="socpophousdata1_dev.social_census_validated.individual",
-        collection_instance_id="2027-CAS-001",
-        variable_name="date_of_birth",
-        expected="yyyy-mm-dd",
-        response_id="P123456789",
-    )
-
-DataFrame exception logging using collectionInstance column
-
-logger.log_dataframe(
-    failed_df,
-    rule="invalid_date_format",
-    event_type="DATACONTRACTVALIDATION",
-    source_table="socpophousdata1_dev.social_census_parsed.individual",
-    target_table="socpophousdata1_dev.social_census_validated.individual",
-    response_id_column="response_id",
-    collection_instance_id_column="collectionInstance",
-    variable_name="date_of_birth",
-    expected="yyyy-mm-dd",
-)
