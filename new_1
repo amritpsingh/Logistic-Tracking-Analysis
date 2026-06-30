@@ -182,16 +182,20 @@ class BaseLogger:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
         
+        notebook_context = get_notebook_run_context()
+
         self._run_id = (
             str(run_id).strip()
             if run_id is not None and str(run_id).strip()
-            else "LOCAL_DEBUG"
+            else notebook_context.get("run_id")
+            or "LOCAL_DEBUG"
         )
 
         self._task_key = (
             str(task_key).strip()
             if task_key is not None and str(task_key).strip()
-            else "LOCAL_DEBUG"
+            else notebook_context.get("task_key")
+            or "LOCAL_DEBUG"
         )
 
         self._spark = spark
@@ -300,7 +304,6 @@ class BaseLogger:
             schema_field_name_set=self._schema_field_name_set,
             table_path=self._table_path,
         )
-
 
 
 
