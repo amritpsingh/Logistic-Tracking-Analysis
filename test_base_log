@@ -1,0 +1,182 @@
+"""Unit tests for utils.logger.base_logger (fake Spark, no cluster)."""
+
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import pytest
+from pyspark.sql.types import StringType, StructField, StructType
+
+from tests.unit._fakes import FakeSpark
+from utils.logger.base_logger import BaseLogger, TableContractError
+
+_SCHEMA = StructType([
+    StructField("id", StringType(), False),
+    StructField("run_id", StringType(), False),
+    StructField("task_key", StringType(), False),
+])
+_TABLE = "cat.schema.tbl"
+_ALL_NONE_CTX = {k: None for k in (
+    "run_id", "job_id", "job_name", "trigger_type", "start_time",
+    "end_time", "task_key", "task_run_id", "parent_run_id",
+)}
+
+
+class ConcreteLogger(BaseLogger):
+    """BaseLogger is concrete now; this just gives tests a class to build a record into."""
+
+
+def _spark():
+    s = FakeSpark()
+    s.catalog.register(_TABLE, _SCHEMA)
+    return s
+
+
+def _logger(spark=None, **kw):
+    params = dict(spark=spark or _spark(), table_path=_TABLE, batch_size=10,
+                  run_id="run-123", task_key="t-1")
+    params.update(kw)
+    return ConcreteLogger(**params)
+
+
+# ── construction ────────────────────────────────────────────
+
+@pytest.mark.parametrize("bad", [0, -1, -100])
+def test_non_positive_batch_size_rejected(bad):
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        _logger(batch_size=bad)
+
+
+def test_missing_table_rejected():
+    with pytest.raises(TableContractError, match="does not exist"):
+        _logger(spark=FakeSpark())  # nothing registered
+
+
+def test_passed_identity_is_used_without_reading_notebook_context():
+    with patch("utils.logger.base_logger.get_notebook_run_context") as ctx:
+        lg = _logger()
+        ctx.assert_not_called()  # happy path takes no Py4J round-trip
+    assert (lg.run_id, lg.task_key) == ("run-123", "t-1")
+
+
+def test_blank_identity_falls_back_to_notebook_context():
+    fake_ctx = {**_ALL_NONE_CTX, "run_id": "ctx-run", "task_key": "ctx-task"}
+    with patch("utils.logger.base_logger.get_notebook_run_context", return_value=fake_ctx):
+        lg = _logger(run_id="", task_key=None)
+    assert (lg.run_id, lg.task_key) == ("ctx-run", "ctx-task")
+
+
+def test_unresolvable_identity_warns_and_uses_local_fallback(caplog):
+    with patch("utils.logger.base_logger.get_notebook_run_context", return_value=dict(_ALL_NONE_CTX)):
+        lg = _logger(run_id=None, task_key=None)
+    assert lg.run_id == "LOCAL_DEBUG" and lg.task_key == "LOCAL_DEBUG"
+    assert any("unresolved" in r.message for r in caplog.records)
+
+
+# ── flush ───────────────────────────────────────────────────
+
+def test_flush_empty_is_noop():
+    spark = _spark()
+    _logger(spark=spark).flush()
+    assert spark.created == []
+
+
+def test_flush_writes_and_clears():
+    spark = _spark()
+    lg = _logger(spark=spark)
+    lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+    lg.flush()
+    df = spark.created[0]
+    assert df._mode == "append" and df._format == "delta" and df.saved_to == _TABLE
+    assert lg.buffer_size == 0
+
+
+@pytest.mark.parametrize("flags", [{"raise_on_create": True}, {"raise_on_save": True}])
+def test_flush_preserves_buffer_on_failure(flags):
+    spark = _spark()
+    spark.raise_on_create = flags.get("raise_on_create", False)
+    spark.raise_on_save = flags.get("raise_on_save", False)
+    lg = _logger(spark=spark)
+    lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+    with pytest.raises(RuntimeError, match="Failed to write"):
+        lg.flush()
+    assert lg.buffer_size == 1
+
+
+def test_flush_chains_original_exception():
+    spark = _spark(); spark.raise_on_create = True
+    lg = _logger(spark=spark)
+    lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+    with pytest.raises(RuntimeError) as exc:
+        lg.flush()
+    assert "simulated createDataFrame failure" in str(exc.value.__cause__)
+
+
+# ── context manager ─────────────────────────────────────────
+
+def test_cm_returns_self_and_flushes_on_clean_exit():
+    spark = _spark()
+    lg = _logger(spark=spark, batch_size=100)
+    with lg as inner:
+        assert inner is lg
+        lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+    assert len(spark.created) == 1 and lg.buffer_size == 0
+
+
+def test_cm_flushes_buffered_records_even_when_block_raises():
+    spark = _spark()
+    lg = _logger(spark=spark, batch_size=100)
+    with pytest.raises(RuntimeError, match="boom"):
+        with lg:
+            lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+            raise RuntimeError("boom")
+    assert len(spark.created) == 1
+
+
+def test_cm_prefers_caller_exception_over_flush_failure(caplog):
+    spark = _spark(); spark.raise_on_create = True
+    lg = _logger(spark=spark)
+
+    class RootCause(Exception):
+        pass
+
+    with pytest.raises(RootCause):
+        with lg:
+            lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+            raise RootCause("real problem")
+    assert any("Flush failed" in r.message for r in caplog.records)
+
+
+def test_cm_propagates_flush_failure_on_clean_exit():
+    spark = _spark(); spark.raise_on_create = True
+    lg = _logger(spark=spark)
+    with pytest.raises(RuntimeError, match="Failed to write"):
+        with lg:
+            lg._buffer.append({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+
+
+# ── helpers ─────────────────────────────────────────────────
+
+def test_add_to_buffer_auto_flushes_at_batch_size():
+    spark = _spark()
+    lg = _logger(spark=spark, batch_size=2)
+    lg._add_to_buffer({"id": "a", "run_id": "run-123", "task_key": "t-1"})
+    assert lg.buffer_size == 1 and spark.created == []
+    lg._add_to_buffer({"id": "b", "run_id": "run-123", "task_key": "t-1"})
+    assert lg.buffer_size == 0 and len(spark.created) == 1
+
+
+def test_execution_fields_returns_only_identity():
+    assert _logger().execution_fields_for_test() if False else \
+        _logger()._execution_fields() == {"run_id": "run-123", "task_key": "t-1"}
+
+
+def test_align_rejects_unknown_keys():
+    lg = _logger()
+    with pytest.raises(ValueError, match="not in"):
+        lg._align({"id": "a", "bogus": 1})
+
+
+def test_align_fills_missing_columns_with_none():
+    lg = _logger()
+    aligned = lg._align({"id": "a"})
+    assert aligned == {"id": "a", "run_id": None, "task_key": None}
