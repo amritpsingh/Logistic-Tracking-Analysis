@@ -1,0 +1,163 @@
+"""Unit tests for utils.logger.exception_logger — single-record + guard rails (fake Spark)."""
+
+from pathlib import Path
+
+import pytest
+import yaml
+from pyspark.sql.types import (
+    BooleanType, StringType, StructField, StructType, TimestampType,
+)
+
+from tests.unit._fakes import FakeInputDataFrame, FakeSpark
+from utils.logger.exception_logger import ExceptionLogger
+from utils.logger.registry import load_registry
+from utils.logger.violation import Violation
+
+_TABLE = "cat.logs.exceptions"
+_SCHEMA = StructType([
+    StructField("id", StringType(), False),
+    StructField("run_id", StringType(), False),
+    StructField("task_key", StringType(), False),
+    StructField("source_table", StringType(), True),
+    StructField("target_table", StringType(), True),
+    StructField("validation_level", StringType(), False),
+    StructField("event_type", StringType(), False),
+    StructField("error_code", StringType(), False),
+    StructField("severity", StringType(), False),
+    StructField("message", StringType(), True),
+    StructField("response_id", StringType(), True),
+    StructField("case_id", StringType(), True),
+    StructField("collection_instance_id", StringType(), True),
+    StructField("variable_name", StringType(), True),
+    StructField("is_blocking", BooleanType(), False),
+    StructField("stack_trace", StringType(), True),
+    StructField("created_timestamp_utc", TimestampType(), False),
+])
+
+_REGISTRY_YAML = {
+    "metadata": {"version": "1.0"},
+    "validation_rules": {
+        "null_not_allowed": {"error_code": "NULL_NOT_ALLOWED"},
+        "invalid_date_format": {"error_code": "INVALID_DATE_FORMAT"},
+        "value_out_of_range": {"error_code": "VALUE_OUT_OF_RANGE"},
+    },
+    "error_codes": {
+        "NULL_NOT_ALLOWED": {"validation_level": "FIELD", "blocking": True, "severity": "ERROR"},
+        "INVALID_DATE_FORMAT": {"validation_level": "FIELD", "blocking": True, "severity": "ERROR"},
+        "VALUE_OUT_OF_RANGE": {"validation_level": "VALUE", "blocking": True, "severity": "ERROR"},
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def _clear_registry_cache():
+    load_registry.cache_clear()
+    yield
+    load_registry.cache_clear()
+
+
+@pytest.fixture
+def registry_file(tmp_path: Path) -> Path:
+    p = tmp_path / "error_codes.yml"
+    p.write_text(yaml.safe_dump(_REGISTRY_YAML))
+    return p
+
+
+def _spark():
+    s = FakeSpark()
+    s.catalog.register(_TABLE, _SCHEMA)
+    return s
+
+
+@pytest.fixture
+def logger(registry_file):
+    return ExceptionLogger(spark=_spark(), registry=load_registry(registry_file),
+                           table_path=_TABLE, run_id="run-xyz", task_key="test_task",
+                           batch_size=100)
+
+
+def _rows(logger):
+    logger.flush()
+    return logger._spark.created[0].rows
+
+
+# ── log() ───────────────────────────────────────────────────
+
+def test_log_resolves_governance_from_registry(logger):
+    logger.log(rule="invalid_date_format", event_type="DATACONTRACTVALIDATION",
+               variable_name="date_of_birth", expected="yyyy-mm-dd", response_id="P1")
+    [r] = _rows(logger)
+    assert r["error_code"] == "INVALID_DATE_FORMAT"
+    assert r["validation_level"] == "FIELD" and r["is_blocking"] is True
+    assert "expected" not in r and "yyyy-mm-dd" in r["message"]
+
+
+def test_log_custom_message_and_stack_trace(logger):
+    logger.log(rule="null_not_allowed", event_type="DC",
+               message="custom", stack_trace="Traceback ...")
+    [r] = _rows(logger)
+    assert r["message"] == "custom" and r["stack_trace"].startswith("Traceback")
+
+
+def test_log_unknown_rule_raises(logger):
+    with pytest.raises(KeyError, match="Unknown validation rule"):
+        logger.log(rule="nope", event_type="DC")
+
+
+def test_log_structured_expected_in_message(logger):
+    logger.log(rule="value_out_of_range", event_type="DC",
+               variable_name="age", expected={"min": 0, "max": 120})
+    [r] = _rows(logger)
+    assert "min" in r["message"] and "max" in r["message"]
+
+
+# ── log_many() ──────────────────────────────────────────────
+
+def test_log_many_shares_response_id_and_timestamp(logger):
+    logger.log_many(
+        [Violation(rule="invalid_date_format", variable_name="dob"),
+         Violation(rule="null_not_allowed", variable_name="name")],
+        event_type="DC", response_id="P999", case_id="C999")
+    rows = _rows(logger)
+    assert [r["response_id"] for r in rows] == ["P999", "P999"]
+    assert len({r["created_timestamp_utc"] for r in rows}) == 1
+
+
+def test_log_many_uses_violation_message_else_default(logger):
+    logger.log_many(
+        [Violation(rule="null_not_allowed", message="explicit"),
+         Violation(rule="null_not_allowed")],
+        event_type="DC", response_id="P1")
+    rows = _rows(logger)
+    assert rows[0]["message"] == "explicit"
+    assert rows[1]["message"].startswith("Rule 'null_not_allowed' failed.")
+
+
+def test_log_many_empty_is_noop(logger):
+    logger.log_many([], event_type="DC", response_id="P1")
+    assert logger.buffer_size == 0
+
+
+# ── log_dataframe guard rails ───────────────────────────────
+
+def test_df_requires_exactly_one_rule(logger):
+    df = FakeInputDataFrame(columns=["response_id"])
+    with pytest.raises(ValueError, match="exactly one"):
+        logger.log_dataframe(df, event_type="DC", response_id_column="response_id")  # neither
+    with pytest.raises(ValueError, match="exactly one"):
+        logger.log_dataframe(df, event_type="DC", response_id_column="response_id",
+                             rule="null_not_allowed", rule_column="response_id")  # both
+
+
+def test_df_rejects_message_and_column_both(logger):
+    df = FakeInputDataFrame(columns=["response_id", "msg"])
+    with pytest.raises(ValueError, match="not both"):
+        logger.log_dataframe(df, event_type="DC", response_id_column="response_id",
+                             rule="null_not_allowed", message="c", message_column="msg")
+
+
+def test_df_missing_response_id_column(logger):
+    df = FakeInputDataFrame(columns=["other"])
+    with pytest.raises(ValueError, match="not in"):
+        logger.log_dataframe(df, event_type="DC", rule="null_not_allowed",
+                             response_id_column="response_id")
