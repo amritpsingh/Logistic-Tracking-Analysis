@@ -1,0 +1,126 @@
+"""Unit tests for utils.logger.event_logger — single-record + guard rails (fake Spark)."""
+
+from datetime import datetime, timezone
+import uuid as uuid_mod
+
+import pytest
+from pyspark.sql.types import StringType, StructField, StructType, TimestampType
+
+from tests.unit._fakes import FakeInputDataFrame, FakeSpark
+from utils.logger.event_logger import EventLogger
+
+_TABLE = "cat.logs.events"
+_SCHEMA = StructType([
+    StructField("id", StringType(), False),
+    StructField("run_id", StringType(), False),
+    StructField("task_key", StringType(), False),
+    StructField("source_table", StringType(), True),
+    StructField("target_table", StringType(), True),
+    StructField("event_type", StringType(), False),
+    StructField("rule_name", StringType(), True),
+    StructField("message", StringType(), True),
+    StructField("response_id", StringType(), True),
+    StructField("case_id", StringType(), True),
+    StructField("collection_instance_id", StringType(), True),
+    StructField("variable_name", StringType(), True),
+    StructField("created_timestamp_utc", TimestampType(), False),
+])
+
+
+def _spark():
+    s = FakeSpark()
+    s.catalog.register(_TABLE, _SCHEMA)
+    return s
+
+
+@pytest.fixture
+def logger():
+    return EventLogger(spark=_spark(), table_path=_TABLE, batch_size=100,
+                       run_id="run-xyz", task_key="test_task")
+
+
+def _row(logger):
+    logger.flush()
+    [record] = logger._spark.created[0].rows
+    return record
+
+
+# ── log() ───────────────────────────────────────────────────
+
+def test_log_assembles_all_fields(logger):
+    logger.log(
+        event_type="coding", message="applied coding",
+        source_table="cat.s.src", target_table="cat.s.tgt",
+        collection_instance_id="2027-TEST-001",
+        rule_name="ethnic_group_v1", response_id="P1", case_id="C1",
+        variable_name="ethnic_group",
+    )
+    r = _row(logger)
+    assert r["event_type"] == "coding"
+    assert r["source_table"] == "cat.s.src" and r["target_table"] == "cat.s.tgt"
+    assert r["collection_instance_id"] == "2027-TEST-001"
+    assert r["rule_name"] == "ethnic_group_v1"
+    assert (r["run_id"], r["task_key"]) == ("run-xyz", "test_task")
+    uuid_mod.UUID(r["id"])
+    assert r["created_timestamp_utc"].tzinfo == timezone.utc
+
+
+def test_log_optional_fields_default_to_none(logger):
+    logger.log(event_type="validation", message="passed")
+    r = _row(logger)
+    for f in ("source_table", "target_table", "collection_instance_id",
+              "rule_name", "response_id", "case_id", "variable_name"):
+        assert r[f] is None
+
+
+def test_log_rejects_framework_managed_id(logger):
+    with pytest.raises(TypeError, match="id"):
+        logger.log(event_type="coding", message="x", id="external")  # type: ignore[call-arg]
+
+
+def test_auto_flush_on_batch_size():
+    spark = _spark()
+    lg = EventLogger(spark=spark, table_path=_TABLE, batch_size=2,
+                     run_id="r", task_key="t")
+    lg.log(event_type="coding", message="1")
+    assert lg.buffer_size == 1 and spark.created == []
+    lg.log(event_type="coding", message="2")
+    assert lg.buffer_size == 0 and len(spark.created) == 1
+
+
+def test_for_task_uses_explicit_table_path():
+    spark = _spark()
+    lg = EventLogger.for_task(spark=spark, run_id="r", task_key="t",
+                              log_table_path=_TABLE)
+    lg.log(event_type="coding", message="x")
+    lg.flush()
+    assert spark.created[0].saved_to == _TABLE
+
+
+# ── log_dataframe guard rails (fire before any Spark transform) ──
+
+def test_df_requires_message_or_column(logger):
+    df = FakeInputDataFrame(columns=["response_id"])
+    with pytest.raises(ValueError, match="Provide"):
+        logger.log_dataframe(df, event_type="coding", response_id_column="response_id")
+
+
+def test_df_rejects_message_and_column_both(logger):
+    df = FakeInputDataFrame(columns=["response_id", "msg"])
+    with pytest.raises(ValueError, match="not both"):
+        logger.log_dataframe(df, event_type="coding", response_id_column="response_id",
+                             message="c", message_column="msg")
+
+
+def test_df_rejects_rule_name_and_column_both(logger):
+    df = FakeInputDataFrame(columns=["response_id", "rule"])
+    with pytest.raises(ValueError, match="not both"):
+        logger.log_dataframe(df, event_type="coding", response_id_column="response_id",
+                             message="m", rule_name="c", rule_name_column="rule")
+
+
+def test_df_missing_response_id_column(logger):
+    df = FakeInputDataFrame(columns=["other"])
+    with pytest.raises(ValueError, match="not in"):
+        logger.log_dataframe(df, event_type="coding", message="m",
+                             response_id_column="response_id")
