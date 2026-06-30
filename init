@@ -1,0 +1,100 @@
+"""
+Structured logging for Data Contract Technical Validation failures and other
+observed events during Combined Census Processing.
+
+Public API:
+
+    PipelineLogger      — final-status writer for the pipeline_run Delta table
+    ExceptionLogger     — buffered writer for the exceptions Delta table
+    EventLogger         — buffered writer for the events Delta table
+    Violation           — dataclass for bulk-logging validation failures
+    ValidationLevel     — FILE / RECORD / FIELD / VALUE enum
+    Severity            — ERROR / WARNING / INFO enum
+    load_registry       — cached loader for the error code registry YAML
+    RegistryLoadError   — raised on registry load/validate failure
+    TableContractError  — raised when a target log table is missing
+
+Identity (run_id, task_key) is passed explicitly from Databricks job
+parameters into the notebook, then into the logger. Processing context
+(source_table, target_table, collection_instance_id) is supplied per log
+call because it can vary by logical step or by DataFrame row.
+
+Typical use — ExceptionLogger (validation failures):
+
+    from utils.logger import ExceptionLogger
+
+    with ExceptionLogger.for_task(
+        spark=spark,
+        run_id=job_metadata["job_run_id"],
+        task_key=job_metadata["task_key"],
+    ) as logger:
+        logger.log(
+            rule="invalid_date_format",
+            event_type="DATACONTRACTVALIDATION",
+            source_table="socpophousdata1_dev.social_census_parsed.individual",
+            target_table="socpophousdata1_dev.social_census_validated.individual",
+            collection_instance_id="2027-CAS-001",
+            variable_name="date_of_birth",
+            expected="yyyy-mm-dd",
+            response_id="P123456789",
+        )
+
+Typical use — EventLogger (informational events):
+
+    from utils.logger import EventLogger
+
+    with EventLogger.for_task(
+        spark=spark,
+        run_id=job_metadata["job_run_id"],
+        task_key=job_metadata["task_key"],
+    ) as logger:
+        logger.log(
+            event_type="coding",
+            message="Applied ethnic group coding rules successfully",
+            source_table="socpophousdata1_dev.social_census_parsed.individual",
+            target_table="socpophousdata1_dev.social_census_classified.individual",
+            collection_instance_id="2027-CAS-001",
+            rule_name="ethnic_group_coding_v1",
+            response_id="P12345",
+            variable_name="ethnic_group",
+        )
+
+Typical use — PipelineLogger (one final row per job run):
+
+    from utils.logger import PipelineLogger
+
+    p = PipelineLogger.for_pipeline(
+        spark=spark,
+        run_id=job_metadata["job_run_id"],
+        job_id=job_metadata["job_id"],
+    )
+    try:
+        ...  # pipeline work
+        p.log(status="SUCCEEDED", record_count=n)
+    except Exception:
+        p.log(status="FAILED")
+        raise
+"""
+
+from .base_logger import TableContractError
+from .event_logger import EventLogger
+from .exception_logger import ExceptionLogger
+from .pipeline_logger import PipelineLogger
+from .registry import (
+    RegistryLoadError,
+    load_registry,
+)
+from .schema import Severity, ValidationLevel
+from .violation import Violation
+
+__all__ = [
+    "PipelineLogger",
+    "ExceptionLogger",
+    "EventLogger",
+    "Violation",
+    "ValidationLevel",
+    "Severity",
+    "load_registry",
+    "RegistryLoadError",
+    "TableContractError",
+]
