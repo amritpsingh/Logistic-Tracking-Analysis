@@ -1,0 +1,99 @@
+"""Unit tests for utils.logger.pipeline_logger (fake Spark)."""
+
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import pytest
+from pyspark.sql.types import (
+    IntegerType, StringType, StructField, StructType, TimestampType,
+)
+
+from tests.unit._fakes import FakeSpark
+
+_TABLE = "cat.logs.pipeline_run"
+_SCHEMA = StructType([
+    StructField("run_id", StringType(), False),
+    StructField("job_id", StringType(), True),
+    StructField("trigger_type", StringType(), True),
+    StructField("start_time", TimestampType(), True),
+    StructField("end_time", TimestampType(), True),
+    StructField("status", StringType(), False),
+    StructField("parent_run_id", StringType(), True),
+    StructField("record_count", IntegerType(), True),
+    StructField("created_timestamp_utc", TimestampType(), False),
+])
+_ALL_NONE_CTX = {k: None for k in (
+    "run_id", "job_id", "job_name", "trigger_type", "start_time",
+    "end_time", "task_key", "task_run_id", "parent_run_id",
+)}
+
+
+def _spark():
+    s = FakeSpark()
+    s.catalog.register(_TABLE, _SCHEMA)
+    return s
+
+
+def _make(spark=None, **kw):
+    from utils.logger.pipeline_logger import PipelineLogger
+    params = dict(spark=spark or _spark(), table_path=_TABLE,
+                  run_id="run-123", job_id="job-9", status="SUCCEEDED")
+    params.update(kw)
+    with patch("utils.logger.pipeline_logger.get_notebook_run_context",
+               return_value=dict(_ALL_NONE_CTX)):
+        return PipelineLogger(**params)
+
+
+def _record(spark):
+    return spark.created[0].rows[0]
+
+
+def test_log_writes_one_row():
+    spark = _spark()
+    _make(spark).log(record_count=42)
+    r = _record(spark)
+    assert r["run_id"] == "run-123" and r["status"] == "SUCCEEDED" and r["record_count"] == 42
+    assert spark.created[0].saved_to == _TABLE
+
+
+def test_log_is_idempotent():
+    spark = _spark()
+    lg = _make(spark)
+    lg.log()
+    lg.log(status="FAILED")
+    assert len(spark.created) == 1
+
+
+def test_status_overridable_at_log_time():
+    spark = _spark()
+    _make(spark, status=None).log(status="FAILED")
+    assert _record(spark)["status"] == "FAILED"
+
+
+def test_missing_status_raises():
+    with pytest.raises(ValueError, match="status is required"):
+        _make(status=None).log()
+
+
+def test_missing_run_id_raises():
+    with pytest.raises(ValueError, match="run_id is required"):
+        _make(run_id=None).log()
+
+
+def test_negative_record_count_raises():
+    with pytest.raises(ValueError, match="record_count cannot be negative"):
+        _make().set_record_count(-1)
+
+
+def test_record_count_none_writes_null():
+    spark = _spark()
+    _make(spark).log()
+    assert _record(spark)["record_count"] is None
+
+
+def test_end_time_defaults_to_utc_now():
+    spark = _spark()
+    before = datetime.now(timezone.utc)
+    _make(spark).log()
+    end = _record(spark)["end_time"]
+    assert end.tzinfo is not None and end >= before
