@@ -1,0 +1,80 @@
+"""Real-Spark tests for log_dataframe output. No Delta — asserts on the
+transform via _build_df(). Requires the build/write seam in the loggers.
+
+Run separately from the fake-Spark unit tests; mark as integration if you
+want `pytest -m "not integration"` to skip them in fast loops.
+"""
+
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StringType, StructField, StructType
+
+# reuse the schema definitions from the unit files or import them
+from tests.unit.test_event_logger import _SCHEMA as EVENTS_SCHEMA
+from tests.unit.test_exception_logger import _SCHEMA as EXC_SCHEMA, _REGISTRY_YAML
+
+from utils.logger.event_logger import EventLogger
+from utils.logger.exception_logger import ExceptionLogger
+from utils.logger.registry import load_registry
+
+
+@pytest.fixture(scope="session")
+def spark():
+    s = (SparkSession.builder.master("local[1]")
+         .appName("logger-tests").getOrCreate())
+    yield s
+    s.stop()
+
+
+def _register_view(spark, name, schema):
+    spark.createDataFrame([], schema).createOrReplaceTempView(name)
+
+
+def test_event_df_one_row_per_input_row(spark):
+    _register_view(spark, "events", EVENTS_SCHEMA)
+    lg = EventLogger(spark=spark, table_path="events", batch_size=100,
+                     run_id="run-1", task_key="t-1")
+    df = spark.createDataFrame(
+        [("P-1", "imputed from age"), ("P-2", "imputed from siblings")],
+        ["response_id", "msg"])
+
+    out = lg._build_df(df, event_type="imputation", rule_name="dob_v1",
+                       message_column="msg", response_id_column="response_id")
+    rows = {r["response_id"]: r for r in out.collect()}
+    assert rows["P-1"]["message"] == "imputed from age"
+    assert rows["P-2"]["rule_name"] == "dob_v1"
+    assert all(r["run_id"] == "run-1" for r in rows.values())
+
+
+def test_exception_df_constant_rule_governance(spark, tmp_path):
+    _register_view(spark, "exceptions", EXC_SCHEMA)
+    import yaml
+    reg = tmp_path / "r.yml"; reg.write_text(yaml.safe_dump(_REGISTRY_YAML))
+    lg = ExceptionLogger(spark=spark, registry=load_registry(reg),
+                         table_path="exceptions", run_id="run-1", task_key="t-1")
+    df = spark.createDataFrame([("P-1",), ("P-2",)], ["response_id"])
+
+    out = lg._build_df(df, rule="invalid_date_format",
+                       event_type="DC", response_id_column="response_id")
+    rows = out.collect()
+    assert all(r["error_code"] == "INVALID_DATE_FORMAT" for r in rows)
+    assert all(r["is_blocking"] is True for r in rows)
+    # df-path default message has no repr quotes — note the format differs
+    assert all("failed." in r["message"] for r in rows)
+
+
+def test_exception_df_per_row_rule_broadcast_join(spark, tmp_path):
+    _register_view(spark, "exceptions", EXC_SCHEMA)
+    import yaml
+    reg = tmp_path / "r.yml"; reg.write_text(yaml.safe_dump(_REGISTRY_YAML))
+    lg = ExceptionLogger(spark=spark, registry=load_registry(reg),
+                         table_path="exceptions", run_id="run-1", task_key="t-1")
+    df = spark.createDataFrame(
+        [("P-1", "null_not_allowed"), ("P-2", "value_out_of_range")],
+        ["response_id", "rule"])
+
+    out = lg._build_df(df, rule_column="rule",
+                       event_type="DC", response_id_column="response_id")
+    by_id = {r["response_id"]: r for r in out.collect()}
+    assert by_id["P-1"]["validation_level"] == "FIELD"
+    assert by_id["P-2"]["validation_level"] == "VALUE"
