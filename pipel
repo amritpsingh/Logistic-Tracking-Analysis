@@ -1,0 +1,222 @@
+"""
+PipelineLogger — final-status logger for Databricks pipeline/job executions.
+
+Writes one row per pipeline/job run to the pipeline_run Delta table.
+
+The caller owns final status and record_count. Databricks job metadata should
+normally be passed by the caller from job parameters. If run_id, job_id, or
+start_time are not supplied, this logger falls back to notebook-context
+metadata from base_logger.get_notebook_run_context().
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Optional
+
+from pyspark.sql import SparkSession
+
+from .base_logger import (
+    align_record_to_schema,
+    clean_string,
+    get_notebook_run_context,
+    load_table_contract,
+)
+from .table_resolver import resolve_log_table_path
+from utils.props_resolver import ensure_props_widgets
+
+
+class PipelineLogger:
+    """
+    Final-status writer for social_census_logs.pipeline_run.
+
+    One instance represents one pipeline/job run.
+    One call to log() appends one final row.
+    """
+
+    def __init__(
+        self,
+        spark: SparkSession,
+        table_path: str,
+        *,
+        run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        trigger_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        status: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        record_count: Optional[int] = None,
+    ):
+        self._spark = spark
+        self._table_path = table_path
+
+        notebook_context = get_notebook_run_context()
+
+        self._run_id = clean_string(run_id) or notebook_context.get("run_id")
+        self._job_id = clean_string(job_id) or notebook_context.get("job_id")
+        self._trigger_type = (
+            clean_string(trigger_type) or notebook_context.get("trigger_type")
+        )
+        self._start_time = start_time or notebook_context.get("start_time")
+        self._end_time = end_time
+        self._status = clean_string(status)
+        self._parent_run_id = (
+            clean_string(parent_run_id) or notebook_context.get("parent_run_id")
+        )
+
+        # run_id is fully determined at construction — no log() parameter or
+        # setter can supply it later — so validate it here. This fails at
+        # for_pipeline() rather than inside the caller's except-block log(),
+        # where a raise would mask the real pipeline exception. status is
+        # validated in log() instead, because it legitimately isn't known
+        # until the run finishes.
+        if clean_string(self._run_id) is None:
+            raise ValueError(
+                "run_id is required. Pass run_id explicitly or run inside a "
+                "Databricks Job with resolvable notebook run context."
+            )
+
+        self._record_count = None
+        self.set_record_count(record_count)
+
+        self._logged = False
+
+        self._schema, self._schema_field_names, self._schema_field_name_set = (
+            load_table_contract(
+                spark=spark,
+                table_path=table_path,
+                table_description="Pipeline run log table",
+            )
+        )
+
+    @classmethod
+    def for_pipeline(
+        cls,
+        spark: SparkSession,
+        *,
+        run_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        trigger_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        status: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        record_count: Optional[int] = None,
+        log_table_path: Optional[str] = None,
+    ) -> "PipelineLogger":
+        """Build a PipelineLogger for one final pipeline/job run record."""
+        ensure_props_widgets()
+
+        table = resolve_log_table_path(
+            dataset="pipeline_run",
+            explicit_table_path=log_table_path,
+        )
+
+        return cls(
+            spark=spark,
+            table_path=table,
+            run_id=run_id,
+            job_id=job_id,
+            trigger_type=trigger_type,
+            start_time=start_time,
+            end_time=end_time,
+            status=status,
+            parent_run_id=parent_run_id,
+            record_count=record_count,
+        )
+
+    def set_record_count(self, record_count: Optional[int]) -> None:
+        """
+        Set or override record_count before log() is called.
+        If record_count is None, the pipeline_run row will contain NULL.
+        """
+        if record_count is None:
+            self._record_count = None
+            return
+
+        value = int(record_count)
+
+        if value < 0:
+            raise ValueError(f"record_count cannot be negative: {record_count}")
+
+        self._record_count = value
+
+    def log(
+        self,
+        *,
+        status: Optional[str] = None,
+        record_count: Optional[int] = None,
+        end_time: Optional[datetime] = None,
+    ) -> None:
+        """
+        Append one final pipeline_run row.
+
+        Args:
+            status: Final status override. Required if not supplied at construction.
+            record_count: Optional record_count override.
+            end_time: Optional end_time override. Defaults to current UTC time
+                if supplied neither here nor at construction.
+        """
+        if self._logged:
+            return
+
+        self._prepare_for_log(
+            status=status,
+            record_count=record_count,
+            end_time=end_time,
+        )
+
+        record = self._build_record()
+        self._write_record(record)
+
+        self._logged = True
+
+    def _prepare_for_log(
+        self,
+        *,
+        status: Optional[str],
+        record_count: Optional[int],
+        end_time: Optional[datetime],
+    ) -> None:
+        """Apply log-time overrides and check required status."""
+        if status is not None:
+            self._status = clean_string(status)
+
+        if record_count is not None:
+            self.set_record_count(record_count)
+
+        if end_time is not None:
+            self._end_time = end_time
+
+        if clean_string(self._status) is None:
+            raise ValueError("status is required")
+
+        if self._end_time is None:
+            self._end_time = datetime.now(timezone.utc)
+
+    def _build_record(self) -> dict:
+        """Build one pipeline_run record using the approved table fields only."""
+        return {
+            "run_id": self._run_id,
+            "job_id": self._job_id,
+            "trigger_type": self._trigger_type,
+            "start_time": self._start_time,
+            "end_time": self._end_time,
+            "status": self._status,
+            "parent_run_id": self._parent_run_id,
+            "record_count": self._record_count,
+            "created_timestamp_utc": datetime.now(timezone.utc),
+        }
+
+    def _write_record(self, record: dict) -> None:
+        """Align one record to the target table schema and append it to Delta."""
+        aligned_record = align_record_to_schema(
+            record,
+            schema_field_names=self._schema_field_names,
+            schema_field_name_set=self._schema_field_name_set,
+            table_path=self._table_path,
+        )
+
+        df = self._spark.createDataFrame([aligned_record], schema=self._schema)
+        df.write.mode("append").format("delta").saveAsTable(self._table_path)
