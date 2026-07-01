@@ -1,7 +1,7 @@
-"""BaseLogger — buffered writer shared by EventLogger and ExceptionLogger.
+base_logger.py
 
-The target Delta table must already exist (created by migration SQL). The
-logger reads its schema at runtime and aligns every record to it.
+"""BaseLogger — buffered writer shared by EventLogger and ExceptionLogger.
+The target Delta table must already exist. The logger reads its schema at runtime and aligns every record to it.
 """
 
 from __future__ import annotations
@@ -16,15 +16,13 @@ from pyspark.sql.types import StructType
 
 log = logging.getLogger(__name__)
 
-# Last-resort identity when run_id/task_key are neither passed nor resolvable
-# from notebook context (e.g. local pytest, interactive REPL). Surfaced as a
-# WARNING, never silently. Flip the two warnings below to `raise ValueError`
-# if the architect wants hard-fail in all non-job contexts.
-_LOCAL_FALLBACK = "LOCAL_DEBUG"
-
 
 class TableContractError(RuntimeError):
-    """Raised when the target log table is missing."""
+    """
+    Raised when a logger's expected schema doesn't match the target
+    Delta table. Carries a descriptive message listing every mismatch so
+    operators can fix all problems in one pass rather than iteratively.
+    """
 
 
 def resolve_log_column(
@@ -79,8 +77,17 @@ def align_record_to_schema(
     return {name: record.get(name) for name in schema_field_names}
 
 
+def clean_string(value: Any) -> Optional[str]:
+    """Return stripped string value, or None when value is None/blank."""
+    if value is None:
+        return None
+
+    value = str(value).strip()
+    return value or None
+
+
 def get_notebook_run_context() -> dict:
-    """Best-effort Databricks notebook/job context reader.
+    """Databricks notebook/job context reader.
 
     Preferred production pattern is still to pass job metadata explicitly from
     job parameters. Returns all-None values when context is unavailable (some
@@ -98,14 +105,8 @@ def get_notebook_run_context() -> dict:
         "parent_run_id": None,
     }
 
-    def clean(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        value = str(value).strip()
-        return value or None
-
     try:
-        from databricks.sdk.runtime import dbutils  # type: ignore[import-not-found]
+        from databricks.sdk.runtime import dbutils
 
         ctx_json = dbutils.notebook.entry_point.getDbutils().notebook().getContext().toJson()
         raw = json.loads(ctx_json)
@@ -113,23 +114,23 @@ def get_notebook_run_context() -> dict:
 
         current_run_id = raw.get("currentRunId")
         if isinstance(current_run_id, dict):
-            context["run_id"] = clean(current_run_id.get("id"))
+            context["run_id"] = clean_string(current_run_id.get("id"))
         else:
-            context["run_id"] = clean(current_run_id)
+            context["run_id"] = clean_string(current_run_id)
         context["run_id"] = (
-            context["run_id"] or clean(tags.get("runId")) or clean(tags.get("jobRunId"))
+            context["run_id"] or clean_string(tags.get("runId")) or clean_string(tags.get("jobRunId"))
         )
 
-        context["job_id"] = clean(tags.get("jobId"))
-        context["job_name"] = clean(tags.get("jobName"))
-        context["task_key"] = clean(tags.get("taskKey"))
-        context["task_run_id"] = clean(tags.get("idInJob"))
-        context["parent_run_id"] = clean(tags.get("parentRunId"))
+        context["job_id"] = clean_string(tags.get("jobId"))
+        context["job_name"] = clean_string(tags.get("jobName"))
+        context["task_key"] = clean_string(tags.get("taskKey"))
+        context["task_run_id"] = clean_string(tags.get("idInJob"))
+        context["parent_run_id"] = clean_string(tags.get("parentRunId"))
         context["trigger_type"] = (
-            clean(tags.get("triggerType")) or clean(tags.get("jobTriggerType"))
+            clean_string(tags.get("triggerType")) or clean_string(tags.get("jobTriggerType"))
         )
 
-        start_ms = clean(tags.get("startTimestamp"))
+        start_ms = clean_string(tags.get("startTimestamp"))
         if start_ms:
             context["start_time"] = datetime.fromtimestamp(int(start_ms) / 1000, tz=timezone.utc)
 
@@ -147,8 +148,8 @@ class BaseLogger:
         spark: SparkSession,
         table_path: str,
         batch_size: int,
-        run_id: str,
-        task_key: str,
+        run_id: Optional[str],
+        task_key: Optional[str],
     ):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -167,24 +168,27 @@ class BaseLogger:
     @staticmethod
     def _resolve_identity(run_id, task_key) -> Tuple[str, str]:
         """Prefer passed values; only read notebook context if something is missing."""
-        def clean(v):
-            return str(v).strip() if v is not None and str(v).strip() else None
 
-        run_id, task_key = clean(run_id), clean(task_key)
+        run_id, task_key = clean_string(run_id), clean_string(task_key)
 
         if run_id and task_key:
-            return run_id, task_key  # happy path — no Py4J round-trip
+            return run_id, task_key
 
         ctx = get_notebook_run_context()
-        run_id = run_id or clean(ctx.get("run_id"))
-        task_key = task_key or clean(ctx.get("task_key"))
+        run_id = run_id or clean_string(ctx.get("run_id"))
+        task_key = task_key or clean_string(ctx.get("task_key"))
 
         if not run_id:
-            log.warning("run_id unresolved; log rows tagged %r", _LOCAL_FALLBACK)
-            run_id = _LOCAL_FALLBACK
+            raise ValueError(
+                "run_id is required. Pass run_id explicitly or run inside a "
+                "Databricks Job with resolvable notebook run context."
+            )
+
         if not task_key:
-            log.warning("task_key unresolved; log rows tagged %r", _LOCAL_FALLBACK)
-            task_key = _LOCAL_FALLBACK
+            raise ValueError(
+                "task_key is required. Pass task_key explicitly or run inside a "
+                "Databricks Job with resolvable notebook run context."
+            )
 
         return run_id, task_key
 
@@ -201,7 +205,7 @@ class BaseLogger:
         return False
 
     def flush(self) -> None:
-        """Append buffered records; buffer is cleared only after a successful write."""
+        """Append buffered records; the buffer is cleared only after a successful write."""
         if not self._buffer:
             return
         try:
@@ -255,6 +259,63 @@ class BaseLogger:
             for f in self._schema.fields
         ])
 
+    @staticmethod
+    def _validate_required_dataframe_column(
+        *,
+        cols: list[str],
+        column_name: str,
+        arg_name: str,
+    ) -> None:
+        """Validate that a required DataFrame column exists."""
+        if column_name not in cols:
+            raise ValueError(
+                f"{arg_name} {column_name!r} not in DataFrame: {cols}"
+            )
+
+    @staticmethod
+    def _validate_value_or_column(
+        *,
+        field: str,
+        value,
+        column: Optional[str],
+        required: bool = False,
+    ) -> None:
+        """
+        Validate a field supplied either as a constant value or a DataFrame column.
+        """
+        if value is not None and column is not None:
+            raise ValueError(
+                f"Pass either `{field}` or `{field}_column`, not both."
+            )
+
+        if required and value is None and column is None:
+            raise ValueError(
+                f"Provide `{field}` or `{field}_column`."
+            )
+
+    @staticmethod
+    def _validate_dataframe_columns(
+        *,
+        cols: list[str],
+        **named_columns,
+    ) -> None:
+        """
+        Validate that optional DataFrame column arguments exist.
+        """
+        for arg_name, column_name in named_columns.items():
+            if column_name is not None and column_name not in cols:
+                raise ValueError(
+                    f"Column {column_name!r} passed as {arg_name} "
+                    f"not in DataFrame: {cols}"
+                )
+
+    def _write_dataframe(self, df) -> None:
+        """
+        Align a DataFrame to the target table schema and append it to Delta.
+        """
+        out = self._to_table_schema(df)
+        out.write.mode("append").format("delta").saveAsTable(self._table_path)
+    
     def _align(self, record: dict) -> dict:
         return align_record_to_schema(
             record,
@@ -262,3 +323,1188 @@ class BaseLogger:
             schema_field_name_set=self._schema_field_name_set,
             table_path=self._table_path,
         )
+
+
+
+event_logger.py
+
+"""
+EventLogger — writes non-fatal observation events to the events Delta table.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from pyspark.sql import functions as F
+
+from .base_logger import BaseLogger, resolve_log_column
+from .table_resolver import resolve_log_table_path
+from utils.props_resolver import ensure_props_widgets
+
+
+_DEFAULT_BATCH_SIZE = 10000
+
+
+class EventLogger(BaseLogger):
+    """Buffered writer for social_census_logs.events. One instance per task."""
+
+    @classmethod
+    def for_task(
+        cls,
+        spark,
+        *,
+        run_id: Optional[str] = None,
+        task_key: Optional[str] = None,
+        log_table_path: Optional[str] = None,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "EventLogger":
+        """
+        Build an EventLogger for one task execution.
+
+        run_id and task_key should normally be passed from Databricks job
+        parameters. If omitted, BaseLogger attempts to resolve them from
+        Databricks notebook run context and raises if unresolved.
+        """
+        ensure_props_widgets()
+
+        table = resolve_log_table_path(
+            dataset="events",
+            explicit_table_path=log_table_path,
+        )
+
+        return cls(
+            spark=spark,
+            table_path=table,
+            batch_size=batch_size,
+            run_id=run_id,
+            task_key=task_key,
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Public API — single record
+    # ────────────────────────────────────────────────────────
+
+    def log(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        variable_name: Optional[str] = None,
+    ) -> None:
+        """Log one observation event."""
+        self._add_to_buffer(
+            {
+                **self._execution_fields(),
+                "id": str(uuid.uuid4()),
+                "source_table": source_table,
+                "target_table": target_table,
+                "event_type": event_type,
+                "rule_name": rule_name,
+                "message": message,
+                "response_id": response_id,
+                "case_id": case_id,
+                "collection_instance_id": collection_instance_id,
+                "variable_name": variable_name,
+                "created_timestamp_utc": datetime.now(timezone.utc),
+            }
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Public API — DataFrame-based bulk logging
+    # ────────────────────────────────────────────────────────
+
+    def log_dataframe(
+        self,
+        df,
+        *,
+        event_type: str,
+        response_id_column: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        message: Optional[str] = None,
+        message_column: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        rule_name_column: Optional[str] = None,
+        case_id_column: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        collection_instance_id_column: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
+    ) -> None:
+        """
+        Append one event row per DataFrame row in a single distributed write.
+        """
+        self.flush()
+
+        cols = df.columns
+
+        self._validate_log_dataframe_args(
+            cols=cols,
+            response_id_column=response_id_column,
+            message=message,
+            message_column=message_column,
+            rule_name=rule_name,
+            rule_name_column=rule_name_column,
+            case_id_column=case_id_column,
+            collection_instance_id=collection_instance_id,
+            collection_instance_id_column=collection_instance_id_column,
+            variable_name=variable_name,
+            variable_name_column=variable_name_column,
+        )
+
+        out = df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            F.lit(event_type).alias("event_type"),
+            resolve_log_column(
+                cols,
+                field="rule_name",
+                const=rule_name,
+                column=rule_name_column,
+            ).alias("rule_name"),
+            resolve_log_column(
+                cols,
+                field="message",
+                const=message,
+                column=message_column,
+                required=True,
+            ).alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(
+                cols,
+                field="case_id",
+                const=None,
+                column=case_id_column,
+            ).alias("case_id"),
+            resolve_log_column(
+                cols,
+                field="collection_instance_id",
+                const=collection_instance_id,
+                column=collection_instance_id_column,
+            ).alias("collection_instance_id"),
+            resolve_log_column(
+                cols,
+                field="variable_name",
+                const=variable_name,
+                column=variable_name_column,
+            ).alias("variable_name"),
+            F.current_timestamp().alias("created_timestamp_utc"),
+        )
+
+        self._write_dataframe(out)
+
+    # ────────────────────────────────────────────────────────
+    # DataFrame validation helpers
+    # ────────────────────────────────────────────────────────
+
+    def _validate_log_dataframe_args(
+        self,
+        *,
+        cols: list[str],
+        response_id_column: str,
+        message: Optional[str],
+        message_column: Optional[str],
+        rule_name: Optional[str],
+        rule_name_column: Optional[str],
+        case_id_column: Optional[str],
+        collection_instance_id: Optional[str],
+        collection_instance_id_column: Optional[str],
+        variable_name: Optional[str],
+        variable_name_column: Optional[str],
+    ) -> None:
+        """
+        Validate log_dataframe arguments before Spark expressions are built.
+
+        This keeps guard-rail errors deterministic and prevents Python from
+        reaching df.select(...) before argument validation has completed.
+        """
+        self._validate_required_dataframe_column(
+            cols=cols,
+            column_name=response_id_column,
+            arg_name="response_id_column",
+        )
+
+        self._validate_value_or_column(
+            field="message",
+            value=message,
+            column=message_column,
+            required=True,
+        )
+
+        self._validate_value_or_column(
+            field="rule_name",
+            value=rule_name,
+            column=rule_name_column,
+        )
+
+        self._validate_value_or_column(
+            field="collection_instance_id",
+            value=collection_instance_id,
+            column=collection_instance_id_column,
+        )
+
+        self._validate_value_or_column(
+            field="variable_name",
+            value=variable_name,
+            column=variable_name_column,
+        )
+
+        self._validate_dataframe_columns(
+            cols=cols,
+            response_id_column=response_id_column,
+            message_column=message_column,
+            rule_name_column=rule_name_column,
+            case_id_column=case_id_column,
+            collection_instance_id_column=collection_instance_id_column,
+            variable_name_column=variable_name_column,
+        )
+
+
+
+
+
+exception_logger.py
+
+"""
+ExceptionLogger — writes Data Contract validation failures to the exceptions table.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional, Union
+
+from pyspark.sql import functions as F
+
+from .base_logger import BaseLogger, resolve_log_column
+from .registry import load_registry
+from .table_resolver import resolve_log_table_path
+from .violation import Violation
+from utils.props_resolver import ensure_props_widgets
+
+
+_DEFAULT_BATCH_SIZE = 10000
+
+
+class ExceptionLogger(BaseLogger):
+    """Buffered writer for social_census_logs.exceptions. One instance per task."""
+
+    def __init__(
+        self,
+        spark,
+        registry,
+        table_path,
+        run_id: Optional[str],
+        task_key: Optional[str],
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ):
+        super().__init__(
+            spark=spark,
+            table_path=table_path,
+            batch_size=batch_size,
+            run_id=run_id,
+            task_key=task_key,
+        )
+        self._registry = registry
+
+    @classmethod
+    def for_task(
+        cls,
+        spark,
+        *,
+        run_id: Optional[str] = None,
+        task_key: Optional[str] = None,
+        log_table_path: Optional[str] = None,
+        registry_path: Optional[Union[str, Path]] = None,
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "ExceptionLogger":
+        """
+        Build an ExceptionLogger for one task execution.
+
+        run_id and task_key should normally be passed from Databricks job
+        parameters. If omitted, BaseLogger attempts to resolve them from
+        Databricks notebook run context and raises if unresolved.
+        """
+        registry = load_registry(registry_path)
+
+        ensure_props_widgets()
+
+        table = resolve_log_table_path(
+            dataset="exceptions",
+            explicit_table_path=log_table_path,
+        )
+
+        return cls(
+            spark=spark,
+            registry=registry,
+            table_path=table,
+            run_id=run_id,
+            task_key=task_key,
+            batch_size=batch_size,
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Public API — single record
+    # ────────────────────────────────────────────────────────
+
+    def log(
+        self,
+        *,
+        rule: str,
+        event_type: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        expected: Any = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        message: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """Log one validation failure or technical exception."""
+        self._add_to_buffer(
+            self._record(
+                rule=rule,
+                event_type=event_type,
+                source_table=source_table,
+                target_table=target_table,
+                collection_instance_id=collection_instance_id,
+                variable_name=variable_name,
+                expected=expected,
+                response_id=response_id,
+                case_id=case_id,
+                message=message,
+                stack_trace=stack_trace,
+            )
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Public API — multiple records
+    # ────────────────────────────────────────────────────────
+
+    def log_many(
+        self,
+        violations: Iterable[Violation],
+        *,
+        event_type: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """
+        Log several violations sharing response_id / case_id / event_type.
+
+        All rows from one log_many() call share the same timestamp.
+        """
+        timestamp = datetime.now(timezone.utc)
+
+        for violation in violations:
+            self._add_to_buffer(
+                self._record(
+                    rule=violation.rule,
+                    event_type=event_type,
+                    source_table=source_table,
+                    target_table=target_table,
+                    collection_instance_id=collection_instance_id,
+                    variable_name=violation.variable_name,
+                    expected=violation.expected,
+                    response_id=response_id,
+                    case_id=case_id,
+                    message=violation.message,
+                    stack_trace=stack_trace,
+                    timestamp=timestamp,
+                )
+            )
+
+    # ────────────────────────────────────────────────────────
+    # Public API — DataFrame-based bulk logging
+    # ────────────────────────────────────────────────────────
+
+    def log_dataframe(
+        self,
+        df,
+        *,
+        event_type: str,
+        response_id_column: str,
+        rule: Optional[str] = None,
+        rule_column: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
+        expected: Any = None,
+        expected_column: Optional[str] = None,
+        case_id_column: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        collection_instance_id_column: Optional[str] = None,
+        message: Optional[str] = None,
+        message_column: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        """
+        Append one exception row per DataFrame row in a single distributed write.
+        """
+        self.flush()
+
+        cols = df.columns
+
+        self._validate_log_dataframe_args(
+            cols=cols,
+            response_id_column=response_id_column,
+            rule=rule,
+            rule_column=rule_column,
+            variable_name=variable_name,
+            variable_name_column=variable_name_column,
+            expected=expected,
+            expected_column=expected_column,
+            case_id_column=case_id_column,
+            collection_instance_id=collection_instance_id,
+            collection_instance_id_column=collection_instance_id_column,
+            message=message,
+            message_column=message_column,
+        )
+
+        df, rule_col, error_code, level, severity, blocking = (
+            self._governance_columns(df, rule, rule_column)
+        )
+
+        out = self._build_log_dataframe_output(
+            df=df,
+            cols=cols,
+            event_type=event_type,
+            response_id_column=response_id_column,
+            source_table=source_table,
+            target_table=target_table,
+            variable_name=variable_name,
+            variable_name_column=variable_name_column,
+            expected=expected,
+            expected_column=expected_column,
+            case_id_column=case_id_column,
+            collection_instance_id=collection_instance_id,
+            collection_instance_id_column=collection_instance_id_column,
+            message=message,
+            message_column=message_column,
+            stack_trace=stack_trace,
+            rule_col=rule_col,
+            error_code=error_code,
+            level=level,
+            severity=severity,
+            blocking=blocking,
+        )
+
+        self._write_dataframe(out)
+
+    # ────────────────────────────────────────────────────────
+    # DataFrame validation helpers
+    # ────────────────────────────────────────────────────────
+
+    def _validate_log_dataframe_args(
+        self,
+        *,
+        cols: list[str],
+        response_id_column: str,
+        rule: Optional[str],
+        rule_column: Optional[str],
+        variable_name: Optional[str],
+        variable_name_column: Optional[str],
+        expected: Any,
+        expected_column: Optional[str],
+        case_id_column: Optional[str],
+        collection_instance_id: Optional[str],
+        collection_instance_id_column: Optional[str],
+        message: Optional[str],
+        message_column: Optional[str],
+    ) -> None:
+        """
+        Validate log_dataframe arguments before Spark expressions are built.
+
+        This keeps guard-rail errors deterministic and prevents Python from
+        reaching df.select(...) before argument validation has completed.
+        """
+        self._validate_required_dataframe_column(
+            cols=cols,
+            column_name=response_id_column,
+            arg_name="response_id_column",
+        )
+
+        if (rule is None) == (rule_column is None):
+            raise ValueError("Provide exactly one of `rule` or `rule_column`.")
+
+        self._validate_value_or_column(
+            field="message",
+            value=message,
+            column=message_column,
+        )
+
+        self._validate_value_or_column(
+            field="variable_name",
+            value=variable_name,
+            column=variable_name_column,
+        )
+
+        self._validate_value_or_column(
+            field="expected",
+            value=expected,
+            column=expected_column,
+        )
+
+        self._validate_value_or_column(
+            field="collection_instance_id",
+            value=collection_instance_id,
+            column=collection_instance_id_column,
+        )
+
+        self._validate_dataframe_columns(
+            cols=cols,
+            rule_column=rule_column,
+            message_column=message_column,
+            response_id_column=response_id_column,
+            case_id_column=case_id_column,
+            variable_name_column=variable_name_column,
+            expected_column=expected_column,
+            collection_instance_id_column=collection_instance_id_column,
+        )
+
+    # ────────────────────────────────────────────────────────
+    # DataFrame expression builders
+    # ────────────────────────────────────────────────────────
+
+    def _build_log_dataframe_output(
+        self,
+        *,
+        df,
+        cols: list[str],
+        event_type: str,
+        response_id_column: str,
+        source_table: Optional[str],
+        target_table: Optional[str],
+        variable_name: Optional[str],
+        variable_name_column: Optional[str],
+        expected: Any,
+        expected_column: Optional[str],
+        case_id_column: Optional[str],
+        collection_instance_id: Optional[str],
+        collection_instance_id_column: Optional[str],
+        message: Optional[str],
+        message_column: Optional[str],
+        stack_trace: Optional[str],
+        rule_col,
+        error_code,
+        level,
+        severity,
+        blocking,
+    ):
+        """
+        Build the Spark DataFrame that matches the exceptions log shape before
+        final table-schema alignment.
+        """
+        expected_col = resolve_log_column(
+            cols,
+            field="expected",
+            const=expected,
+            column=expected_column,
+        )
+
+        message_col = resolve_log_column(
+            cols,
+            field="message",
+            const=message,
+            column=message_column,
+        )
+
+        message_out = F.coalesce(
+            message_col,
+            self._default_message(rule_col, expected_col),
+        )
+
+        return df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            level.alias("validation_level"),
+            F.lit(event_type).alias("event_type"),
+            error_code.alias("error_code"),
+            severity.alias("severity"),
+            message_out.alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(
+                cols,
+                field="case_id",
+                const=None,
+                column=case_id_column,
+            ).alias("case_id"),
+            resolve_log_column(
+                cols,
+                field="collection_instance_id",
+                const=collection_instance_id,
+                column=collection_instance_id_column,
+            ).alias("collection_instance_id"),
+            resolve_log_column(
+                cols,
+                field="variable_name",
+                const=variable_name,
+                column=variable_name_column,
+            ).alias("variable_name"),
+            blocking.alias("is_blocking"),
+            F.lit(stack_trace).alias("stack_trace"),
+            F.current_timestamp().alias("created_timestamp_utc"),
+        )
+
+    # ────────────────────────────────────────────────────────
+    # Governance resolution
+    # ────────────────────────────────────────────────────────
+
+    def _governance_columns(self, df, rule, rule_column):
+        """
+        Resolve rule(s) to governance columns.
+
+        For constant rule:
+            Resolve once and return literal Spark columns.
+
+        For per-row rule_column:
+            Resolve distinct rule values on the driver, build a small lookup
+            DataFrame, and broadcast-join it to the source DataFrame.
+        """
+        if (rule is None) == (rule_column is None):
+            raise ValueError("Provide exactly one of `rule` or `rule_column`.")
+
+        if rule_column is not None:
+            if rule_column not in df.columns:
+                raise ValueError(f"rule_column {rule_column!r} not in {df.columns}")
+
+            rows = []
+
+            for rule_value in (
+                row[0]
+                for row in df.select(rule_column).distinct().collect()
+            ):
+                resolved = self._registry.resolve(rule_value)
+                rows.append(
+                    (
+                        rule_value,
+                        resolved.error_code,
+                        resolved.validation_level.value,
+                        resolved.severity.value,
+                        resolved.is_blocking,
+                    )
+                )
+
+            lookup = self._spark.createDataFrame(
+                rows,
+                "_gov_rule string, _gov_error_code string, _gov_level string, "
+                "_gov_severity string, _gov_blocking boolean",
+            )
+
+            df = df.join(
+                F.broadcast(lookup),
+                F.col(rule_column) == F.col("_gov_rule"),
+                "left",
+            )
+
+            return (
+                df,
+                F.col(rule_column),
+                F.col("_gov_error_code"),
+                F.col("_gov_level"),
+                F.col("_gov_severity"),
+                F.col("_gov_blocking"),
+            )
+
+        resolved = self._registry.resolve(rule)
+
+        return (
+            df,
+            F.lit(rule),
+            F.lit(resolved.error_code),
+            F.lit(resolved.validation_level.value),
+            F.lit(resolved.severity.value),
+            F.lit(resolved.is_blocking),
+        )
+
+    @staticmethod
+    def _default_message(rule_col, expected_col):
+        rule_str = rule_col.cast("string")
+        base = F.concat(F.lit("Rule '"), rule_str, F.lit("' failed."))
+        with_expected = F.concat(
+            F.lit("Rule '"),
+            rule_str,
+            F.lit("' failed. Expected="),
+            expected_col.cast("string"),
+        )
+        return F.when(expected_col.isNotNull(), with_expected).otherwise(base)
+
+    # ────────────────────────────────────────────────────────
+    # Single-record assembly
+    # ────────────────────────────────────────────────────────
+
+    def _record(
+        self,
+        *,
+        rule,
+        event_type,
+        source_table,
+        target_table,
+        collection_instance_id,
+        variable_name,
+        expected,
+        response_id,
+        case_id,
+        message,
+        stack_trace,
+        timestamp=None,
+    ) -> dict:
+        resolved = self._registry.resolve(rule)
+
+        if message is None:
+            message = (
+                f"Rule {rule!r} failed. Expected={expected!r}"
+                if expected is not None
+                else f"Rule {rule!r} failed."
+            )
+
+        timestamp = timestamp or datetime.now(timezone.utc)
+
+        return {
+            **self._execution_fields(),
+            "id": str(uuid.uuid4()),
+            "source_table": source_table,
+            "target_table": target_table,
+            "validation_level": resolved.validation_level.value,
+            "event_type": event_type,
+            "error_code": resolved.error_code,
+            "severity": resolved.severity.value,
+            "message": message,
+            "response_id": response_id,
+            "case_id": case_id,
+            "collection_instance_id": collection_instance_id,
+            "variable_name": variable_name,
+            "is_blocking": resolved.is_blocking,
+            "stack_trace": stack_trace,
+            "created_timestamp_utc": timestamp,
+        }
+
+
+
+registry.py
+
+"""
+Runtime interface for the error code registry.
+
+- ErrorCodeRegistry - runtime lookup class
+- ResolvedCode - frozen bundle returned by registry.resolve()
+- load_registry - loads + validates YAML, cached per process
+- RegistryLoadError - raised on any failure to load/validate YAML
+"""
+
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable, Union
+
+import yaml
+from pydantic import ValidationError
+
+from .schema import (
+    ErrorCodeRegistrySchema,
+    Severity,
+    ValidationLevel,
+)
+
+
+_MODULE_DIR = Path(__file__).parent
+DEFAULT_REGISTRY_PATH: Path = _MODULE_DIR / "config" / "error_codes.yml"
+
+
+class RegistryLoadError(Exception):
+    """
+    Raised when there is an error loading or validating the registry YAML.
+    """
+
+
+@dataclass(frozen=True)
+class ResolvedCode:
+    """
+    A resolved error code, with all the information needed to process it.
+    """
+
+    error_code: str
+    validation_level: ValidationLevel
+    severity: Severity
+    is_blocking: bool
+
+
+class ErrorCodeRegistry:
+    """
+    Runtime interface for looking up validation semantics.
+
+    Resolve a validator-facing rule name into a governance bundle:
+
+        resolved = registry.resolve("invalid_date_format")
+        resolved.error_code
+        resolved.validation_level
+        resolved.severity
+        resolved.is_blocking
+    """
+
+    def __init__(self, schema: ErrorCodeRegistrySchema):
+        self._rules = schema.validation_rules
+        self._codes = schema.error_codes
+
+    def resolve(self, rule: str) -> ResolvedCode:
+        """
+        Resolve a validator-facing rule name into governance metadata.
+
+        Raises:
+            KeyError: if the rule is not found in the registry.
+        """
+        try:
+            rule_def = self._rules[rule]
+        except KeyError:
+            raise KeyError(
+                f"Unknown validation rule: {rule!r}. "
+                f"Check registry YAML or use ErrorCodeRegistry.known_rules()"
+            ) from None
+
+        code_def = self._codes[rule_def.error_code]
+
+        return ResolvedCode(
+            error_code=rule_def.error_code,
+            validation_level=code_def.validation_level,
+            severity=code_def.severity,
+            is_blocking=code_def.blocking,
+        )
+
+    def resolve_many(self, rules: Iterable[str]) -> dict[str, ResolvedCode]:
+        """
+        Resolve many rule names into governance metadata.
+
+        Duplicate rule names are resolved once.
+
+        Args:
+            rules: Iterable of validation rule names.
+
+        Returns:
+            Dictionary keyed by rule name.
+
+        Raises:
+            KeyError: if any rule is unknown.
+        """
+        unique_rules = sorted(set(rules))
+
+        return {
+            rule: self.resolve(rule)
+            for rule in unique_rules
+        }
+
+    def to_lookup_rows(self, rules: Iterable[str]) -> list[tuple]:
+        """
+        Resolve rule names into Spark lookup rows.
+
+        This is used by ExceptionLogger.log_dataframe() when each row can
+        carry a different rule value.
+
+        Returns rows shaped as:
+            (
+                rule,
+                error_code,
+                validation_level,
+                severity,
+                is_blocking,
+            )
+        """
+        resolved_by_rule = self.resolve_many(rules)
+
+        return [
+            (
+                rule,
+                resolved.error_code,
+                resolved.validation_level.value,
+                resolved.severity.value,
+                resolved.is_blocking,
+            )
+            for rule, resolved in resolved_by_rule.items()
+        ]
+
+    def known_rules(self) -> list[str]:
+        """Return all registered validation rule names."""
+        return sorted(self._rules.keys())
+
+
+@lru_cache(maxsize=4)
+def load_registry(registry_path: Union[str, Path, None] = None) -> ErrorCodeRegistry:
+    """
+    Load and validate the error code registry YAML, then wrap it in a runtime
+    ErrorCodeRegistry.
+
+    Cached per process. The cache is keyed on the path.
+
+    Args:
+        registry_path: Path to the registry YAML. Defaults to
+            config/error_codes.yml in the module directory.
+
+    Raises:
+        RegistryLoadError: on file I/O, YAML parse, or schema validation failure.
+    """
+    path = Path(registry_path) if registry_path is not None else DEFAULT_REGISTRY_PATH
+
+    if not path.exists():
+        raise RegistryLoadError(f"Error code registry file not found: {path}")
+
+    try:
+        with path.open("r") as file:
+            raw = yaml.safe_load(file)
+    except yaml.YAMLError as exc:
+        raise RegistryLoadError(f"Malformed YAML at {path}: {exc}") from exc
+    except OSError as exc:
+        raise RegistryLoadError(f"Unable to read {path}: {exc}") from exc
+
+    if raw is None:
+        raise RegistryLoadError(f"Empty YAML file: {path}")
+
+    try:
+        schema = ErrorCodeRegistrySchema(**raw)
+    except ValidationError as exc:
+        raise RegistryLoadError(
+            f"Invalid error code registry at {path}: {exc}"
+        ) from exc
+
+    return ErrorCodeRegistry(schema)
+
+
+
+table_resolver.py
+
+from __future__ import annotations
+
+from typing import Optional
+
+from config_models.collection_config import CollectionConfig
+from utils.props_resolver import (
+    ensure_props_widgets,
+    resolve_collection,
+    resolve_target,
+)
+
+
+def resolve_log_table_path(
+    *,
+    dataset: str,
+    explicit_table_path: Optional[str] = None,
+) -> str:
+    """Resolve a logger Delta table path.
+
+    Resolution order:
+      1. explicit_table_path
+      2. CollectionConfig(collection, target).get_table_path(dataset, "logs")
+    """
+
+    if explicit_table_path:
+        return explicit_table_path
+
+    return CollectionConfig(
+        collection=resolve_collection(),
+        environment=resolve_target(),
+    ).get_table_path(dataset=dataset, steady_state="logs")
+
+
+
+
+violation.py
+
+
+"""
+The Violation dataclass — a single validation failure observation.
+
+The registry resolves ``rule`` into the governance fields (error_code, validation_level, severity, is_blocking). 
+The caller shares: they report WHAT failed and WHAT the values were. 
+The logger owns HOW the system classifies it.
+"""
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+
+@dataclass(frozen=True)
+class Violation:
+    """
+    A single validation failure observation.
+
+    Attributes:
+        rule: Registered validation rule name (must exist in the registry
+            YAML). Determines error_code, validation_level, severity,
+            is_blocking at log time.
+        variable_name: Name of the variable that failed, if applicable. 
+            None for FILE-level or RECORD-level failures where 
+            the failure isn't tied to a specific variable.
+        expected: What was expected. expected is used only for 
+        default message generation and is not stored as a dedicated table column.
+        message: Optional message for this specific violation. 
+            When set, it is used as-is. When None, the logger auto-generates 
+            a default ``"Rule X failed. Expected Y, observed Z."`` message.
+    """
+
+    rule: str
+    variable_name: Optional[str] = None
+    expected: Optional[str] = None
+    message: Optional[str] = None
+
+
+
+
+schema.py
+
+"""
+Pydantic schemas and enums for the error code registry
+
+The registry enforces separation between:
+- validation rules (what failed)
+- error codes (how system reacts)
+
+This module is the structural contract for the registry YAML. A change here is a breaking change to governance model.
+"""
+
+from enum import Enum
+from typing import Dict, Optional
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+
+# ─────────────────────────────────────────────
+# Enums
+# ─────────────────────────────────────────────
+
+class ValidationLevel(str, Enum):
+    """Data contract technical validation levels"""
+
+    FILE = "FILE"
+    RECORD = "RECORD"
+    FIELD = "FIELD"
+    VALUE = "VALUE"
+
+
+class Severity(str, Enum):
+    """Severity of logged observation"""
+
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+    INFO = "INFO"
+
+
+# ─────────────────────────────────────────────
+# Error Code Definition (HOW system reacts)
+# ─────────────────────────────────────────────
+
+class ErrorCodeDefinition(BaseModel):
+    """
+    Governance metadata for a single error code.
+    Enforces:
+        - FILE / RECORD / FIELD levels must be ERROR severity and blocking
+        - INFO severity must never be blocking
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    validation_level: ValidationLevel
+    blocking: bool
+    severity: Severity
+    description: Optional[str] = None
+
+    @model_validator(mode="after")
+    def enforce_governance_rules(self) -> "ErrorCodeDefinition":
+        
+        structural_levels = {
+            ValidationLevel.FILE,
+            ValidationLevel.RECORD,
+            ValidationLevel.FIELD,
+        }
+
+        if self.validation_level in structural_levels:
+            if self.severity is not Severity.ERROR:
+                raise ValueError(
+                    f"{self.validation_level.value} - level errors must have"
+                    f"severity ERROR (got {self.severity.value})"
+                )
+            if not self.blocking:
+                raise ValueError(
+                    f"{self.validation_level.value} - level errors must be blocking"
+                )
+
+        # INFO must never block
+        if self.severity is Severity.INFO and self.blocking:
+            raise ValueError("INFO severity errors cannot be blocking")
+
+        return self
+
+
+# ─────────────────────────────────────────────
+# Validation Rule (WHAT failed)
+# ─────────────────────────────────────────────
+
+class ValidationRule(BaseModel):
+    """A validator facing rule  that maps to exactly one error code"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    error_code: str
+    description: Optional[str] = None
+
+# ─────────────────────────────────────────────
+# Metadata
+# ─────────────────────────────────────────────
+class RegistryMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    description: Optional[str] = None
+    owner: Optional[str] = None
+    approved_by: Optional[str] = None
+    last_updated: Optional[str] = None
+
+
+# ─────────────────────────────────────────────
+# Registry Root Model
+# ─────────────────────────────────────────────
+
+class ErrorCodeRegistrySchema(BaseModel):
+    """Root model for the error code registry YAML."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: RegistryMetadata
+    validation_rules: Dict[str, ValidationRule]
+    error_codes: Dict[str, ErrorCodeDefinition]
+
+    @model_validator(mode="after")
+    def validate_cross_references(self) -> "ErrorCodeRegistrySchema":
+        # Ensure every rule references a defined error code
+        
+        for rule_name, rule in self.validation_rules.items():
+            if rule.error_code not in self.error_codes:
+                raise ValueError(
+                    f"Validation rule '{rule_name}' references "
+                    f"undefined error_code '{rule.error_code}'"
+                )
+        return self
+
+
+
