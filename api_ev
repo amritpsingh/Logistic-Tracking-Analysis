@@ -1,239 +1,160 @@
-pipeline_logger.py
-
 """
-PipelineLogger — final-status logger for Databricks pipeline/job executions.
-
-Writes one row per pipeline/job run to the pipeline_run Delta table.
-
-The caller owns final status and record_count. Databricks job metadata should
-normally be passed by the caller from job parameters. If run_id, job_id, or
-start_time are not supplied, this logger uses lightweight notebook-context
-fallback metadata from base_logger.get_notebook_run_context().
+EventLogger — writes non-fatal observation events to the events Delta table.
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from .base_logger import (
-    align_record_to_schema,
-    get_notebook_run_context,
-    load_table_contract,
-)
+from .base_logger import BaseLogger, resolve_log_column
 from .table_resolver import resolve_log_table_path
 from utils.props_resolver import ensure_props_widgets
 
 
-class PipelineLogger:
-    """
-    Final-status writer for social_census_logs.pipeline_run.
+_DEFAULT_BATCH_SIZE = 10000
 
-    One instance represents one pipeline/job run.
-    One call to log() appends one final row.
-    """
 
-    def __init__(
-        self,
-        spark: SparkSession,
-        table_path: str,
-        *,
-        run_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        trigger_type: Optional[str] = None,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
-        status: Optional[str] = None,
-        parent_run_id: Optional[str] = None,
-        record_count: Optional[int] = None,
-    ):
-        self._spark = spark
-        self._table_path = table_path
-
-        notebook_context = get_notebook_run_context()
-
-        self._run_id = self._first_value(run_id, notebook_context.get("run_id"))
-        self._job_id = self._first_value(job_id, notebook_context.get("job_id"))
-        self._trigger_type = self._first_value(
-            trigger_type,
-            notebook_context.get("trigger_type"),
-        )
-        self._start_time = start_time or notebook_context.get("start_time")
-        self._end_time = end_time
-        self._status = self._first_value(status, None)
-        self._parent_run_id = self._first_value(
-            parent_run_id,
-            notebook_context.get("parent_run_id"),
-        )
-
-        self._record_count = None
-        self.set_record_count(record_count)
-
-        self._logged = False
-
-        self._schema, self._schema_field_names, self._schema_field_name_set = (
-            load_table_contract(
-                spark=spark,
-                table_path=table_path,
-                table_description="Pipeline run log table",
-            )
-        )
+class EventLogger(BaseLogger):
+    """Buffered writer for social_census_logs.events. One instance per task."""
 
     @classmethod
-    def for_pipeline(
+    def for_task(
         cls,
-        spark: SparkSession,
+        spark,
         *,
         run_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        trigger_type: Optional[str] = None,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
-        status: Optional[str] = None,
-        parent_run_id: Optional[str] = None,
-        record_count: Optional[int] = None,
+        task_key: Optional[str] = None,
         log_table_path: Optional[str] = None,
-    ) -> "PipelineLogger":
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+    ) -> "EventLogger":
         """
-        Build a PipelineLogger for one final pipeline/job run record.
+        Build an EventLogger for one task execution.
+
+        run_id and task_key should normally be passed from Databricks job
+        parameters. If omitted, BaseLogger attempts to resolve them from
+        Databricks notebook run context and raises if unresolved.
         """
         ensure_props_widgets()
 
         table = resolve_log_table_path(
-            dataset="pipeline_run",
+            dataset="events",
             explicit_table_path=log_table_path,
         )
 
         return cls(
             spark=spark,
             table_path=table,
+            batch_size=batch_size,
             run_id=run_id,
-            job_id=job_id,
-            trigger_type=trigger_type,
-            start_time=start_time,
-            end_time=end_time,
-            status=status,
-            parent_run_id=parent_run_id,
-            record_count=record_count,
+            task_key=task_key,
         )
 
-    def set_record_count(self, record_count: Optional[int]) -> None:
-        """
-        Set or override record_count before log() is called.
-        If record_count is None, the pipeline_run row will contain NULL.
-        """
-        if record_count is None:
-            self._record_count = None
-            return
-
-        value = int(record_count)
-
-        if value < 0:
-            raise ValueError(f"record_count cannot be negative: {record_count}")
-
-        self._record_count = value
+    # ────────────────────────────────────────────────────────
+    # Public API — single record
+    # ────────────────────────────────────────────────────────
 
     def log(
         self,
         *,
-        status: Optional[str] = None,
-        record_count: Optional[int] = None,
-        end_time: Optional[datetime] = None,
+        event_type: str,
+        message: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        response_id: Optional[str] = None,
+        case_id: Optional[str] = None,
+        variable_name: Optional[str] = None,
     ) -> None:
-        """
-        Append one final pipeline_run row.
-
-        Args:
-            status: Optional final status override. Required if not supplied
-                during logger construction.
-            record_count: Optional record_count override.
-            end_time: Optional end_time override. If not supplied through log() or
-                constructor, current UTC timestamp is used.
-        """
-        if self._logged:
-            return
-
-        self._prepare_for_log(
-            status=status,
-            record_count=record_count,
-            end_time=end_time,
+        """Log one observation event."""
+        self._add_to_buffer(
+            {
+                **self._execution_fields(),
+                "id": str(uuid.uuid4()),
+                "source_table": source_table,
+                "target_table": target_table,
+                "event_type": event_type,
+                "rule_name": rule_name,
+                "message": message,
+                "response_id": response_id,
+                "case_id": case_id,
+                "collection_instance_id": collection_instance_id,
+                "variable_name": variable_name,
+                "created_timestamp_utc": datetime.now(timezone.utc),
+            }
         )
 
-        record = self._build_record()
-        self._write_record(record)
+    # ────────────────────────────────────────────────────────
+    # Public API — DataFrame-based bulk logging
+    # ────────────────────────────────────────────────────────
 
-        self._logged = True
-
-    def _prepare_for_log(
+    def log_dataframe(
         self,
+        df,
         *,
-        status: Optional[str],
-        record_count: Optional[int],
-        end_time: Optional[datetime],
+        event_type: str,
+        response_id_column: str,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        message: Optional[str] = None,
+        message_column: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        rule_name_column: Optional[str] = None,
+        case_id_column: Optional[str] = None,
+        collection_instance_id: Optional[str] = None,
+        collection_instance_id_column: Optional[str] = None,
+        variable_name: Optional[str] = None,
+        variable_name_column: Optional[str] = None,
     ) -> None:
         """
-        Apply log-time overrides and perform required-value checks.
+        Append one event row per DataFrame row in a single distributed write.
+
+        Constant-vs-column fields (message, rule_name, collection_instance_id,
+        variable_name, case_id) are validated by resolve_log_column as their
+        expressions are built. response_id is checked inline below because it
+        is consumed via F.col directly and would otherwise defer to Spark's
+        analysis phase.
         """
-        if status is not None:
-            self._status = self._first_value(status, None)
+        # log_dataframe writes directly, bypassing the buffer — flush first so
+        # any buffered single-record events land before these rows.
+        self.flush()
 
-        if record_count is not None:
-            self.set_record_count(record_count)
+        cols = df.columns
+        if response_id_column not in cols:
+            raise ValueError(
+                f"response_id_column {response_id_column!r} not in DataFrame: {cols}"
+            )
 
-        if end_time is not None:
-            self._end_time = end_time
-
-        if self._is_blank(self._run_id):
-            raise ValueError("run_id is required")
-
-        if self._is_blank(self._status):
-            raise ValueError("status is required")
-
-        if self._end_time is None:
-            self._end_time = datetime.now(timezone.utc)
-
-    def _build_record(self) -> dict:
-        """
-        Build one pipeline_run record using the approved table fields only.
-        """
-        return {
-            "run_id": self._run_id,
-            "job_id": self._job_id,
-            "trigger_type": self._trigger_type,
-            "start_time": self._start_time,
-            "end_time": self._end_time,
-            "status": self._status,
-            "parent_run_id": self._parent_run_id,
-            "record_count": self._record_count,
-            "created_timestamp_utc": datetime.now(timezone.utc),
-        }
-
-    def _write_record(self, record: dict) -> None:
-        """
-        Align one record to target table schema and append it to Delta.
-        """
-        aligned_record = align_record_to_schema(
-            record,
-            schema_field_names=self._schema_field_names,
-            schema_field_name_set=self._schema_field_name_set,
-            table_path=self._table_path,
+        out = df.select(
+            F.expr("uuid()").alias("id"),
+            F.lit(self._run_id).alias("run_id"),
+            F.lit(self._task_key).alias("task_key"),
+            F.lit(source_table).alias("source_table"),
+            F.lit(target_table).alias("target_table"),
+            F.lit(event_type).alias("event_type"),
+            resolve_log_column(
+                cols, field="rule_name", const=rule_name, column=rule_name_column,
+            ).alias("rule_name"),
+            resolve_log_column(
+                cols, field="message", const=message, column=message_column, required=True,
+            ).alias("message"),
+            F.col(response_id_column).alias("response_id"),
+            resolve_log_column(
+                cols, field="case_id", const=None, column=case_id_column,
+            ).alias("case_id"),
+            resolve_log_column(
+                cols, field="collection_instance_id",
+                const=collection_instance_id, column=collection_instance_id_column,
+            ).alias("collection_instance_id"),
+            resolve_log_column(
+                cols, field="variable_name",
+                const=variable_name, column=variable_name_column,
+            ).alias("variable_name"),
+            F.current_timestamp().alias("created_timestamp_utc"),
         )
 
-        df = self._spark.createDataFrame([aligned_record], schema=self._schema)
-        df.write.mode("append").format("delta").saveAsTable(self._table_path)
-
-    @staticmethod
-    def _first_value(primary, fallback):
-        """
-        Return primary if it is non-blank, otherwise fallback.
-        """
-        if primary is not None and str(primary).strip():
-            return str(primary).strip()
-
-        return fallback
-
-    @staticmethod
-    def _is_blank(value) -> bool:
-        return value is None or str(value).strip() == ""
+        self._write_dataframe(out)
