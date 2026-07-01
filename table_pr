@@ -1,0 +1,106 @@
+PR 1 — Refactor
+Branch: refactor/logger-module
+Title: refactor(logger): schema-from-table, explicit identity, distributed log_dataframe
+Commit message:
+
+refactor(logger): simplify and align with architect direction
+
+Read log-table schema from the live Delta table instead of hardcoded
+per-subclass StructTypes; the table is the runtime contract. Make run
+identity explicit — run_id/task_key are passed from job parameters, with
+notebook-context fallback and fail-fast when unresolvable. Remove the
+per-task RunContext/context.py layer.
+
+Rewrite log_dataframe as a distributed column transform (F.expr/F.lit +
+broadcast-join for per-row governance) instead of collect()-to-driver.
+No driver row limit; source data never leaves the cluster.
+
+Collapse duplicated argument validation onto resolve_log_column as the
+single source of truth; keep only the inline response_id check it can't
+cover. Wire registry.to_lookup_rows into governance resolution so the
+lookup tuple shape has one definition. Guard bulk `expected` to scalar,
+closing the log()/log_dataframe divergence.
+
+Remove context.py, redundant validators, and stale docstrings.
+
+PR description:
+
+## What
+Simplification pass on the logger module ahead of pipeline logging.
+
+## Changes
+- Schema read from the target Delta table at runtime (load_table_contract);
+  removes hardcoded _SCHEMA from EventLogger/ExceptionLogger.
+- run_id/task_key passed explicitly from job params; notebook-context
+  fallback; construction raises if unresolvable. context.py deleted.
+- source_table/target_table/collection_instance_id moved from constructor
+  to per-call, supporting multi-step notebooks and per-row values.
+- log_dataframe is now a single distributed write (no collect, no 100k cap).
+- Validation collapsed onto resolve_log_column; to_lookup_rows wired in;
+  scalar-expected guard added.
+- __init__.py: context exports removed, examples corrected.
+
+## Caller-facing breaking changes
+- for_task(run_id=, task_key=) — collection/source/target now per log call.
+- log_dataframe returns None (was a row count); no oversized-input ValueError.
+- Blank run_id/task_key raises at construction.
+
+## Verification
+- [ ] grep clean: no RunContext/build_run_context/old for_task signature
+- [ ] unit suite green (row-limit/buffer-after-df tests removed)
+- [ ] events + exceptions log tables exist in target env
+
+## Not included
+PipelineLogger (follow-up PR, depends on this).
+
+
+
+PR 2 — Pipeline logger
+Branch: feat/pipeline-logger (cut from refactor/logger-module)
+Title: feat(logger): add PipelineLogger for final run-status records
+Commit message:
+
+feat(logger): add PipelineLogger for pipeline_run
+
+Write one final-status row per pipeline/job run to pipeline_run. Caller
+owns status and record_count; run_id/job_id/trigger_type/start_time/
+parent_run_id fall back to notebook context when not passed.
+
+Composes base_logger helpers rather than extending BaseLogger — single
+row, no buffer. run_id validated at construction (fails at for_pipeline,
+not inside the caller's except-block log()); status validated at log().
+log() is idempotent per instance.
+
+Depends on refactor/logger-module.
+
+
+PR description:
+
+## What
+Adds PipelineLogger — one final-status record per pipeline/job run.
+
+## Depends on
+#<PR-1>. Imports clean_string/load_table_contract/get_notebook_run_context/
+align_record_to_schema from the refactored base_logger. Merge after PR 1.
+
+## Design
+- Composition over inheritance: single-row writer, no buffering needed.
+- Intended caller pattern (per architect):
+    p = PipelineLogger.for_pipeline(...)
+    try:
+        ...work...
+        p.log(status="SUCCEEDED", record_count=n)
+    except Exception:
+        p.log(status="FAILED")
+        raise
+- run_id validated in __init__ so a bad config can't mask the real
+  exception in the except-block. status validated at log().
+
+## Verification
+- [ ] pipeline_run DDL merged; columns match _build_record; record_count bigint
+- [ ] test schema uses LongType for record_count
+- [ ] __init__.py exports PipelineLogger
+
+## Follow-ups (not blocking)
+- YAML↔logger schema consistency test once the table-creation module lands.
+- Optional debug log on second log() no-op.
