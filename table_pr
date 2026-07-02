@@ -1,106 +1,1890 @@
-PR 1 — Refactor
-Branch: refactor/logger-module
-Title: refactor(logger): schema-from-table, explicit identity, distributed log_dataframe
-Commit message:
+SPH_Survey_Data_Sourcing/src/transformations/parsing.py
 
-refactor(logger): simplify and align with architect direction
-
-Read log-table schema from the live Delta table instead of hardcoded
-per-subclass StructTypes; the table is the runtime contract. Make run
-identity explicit — run_id/task_key are passed from job parameters, with
-notebook-context fallback and fail-fast when unresolvable. Remove the
-per-task RunContext/context.py layer.
-
-Rewrite log_dataframe as a distributed column transform (F.expr/F.lit +
-broadcast-join for per-row governance) instead of collect()-to-driver.
-No driver row limit; source data never leaves the cluster.
-
-Collapse duplicated argument validation onto resolve_log_column as the
-single source of truth; keep only the inline response_id check it can't
-cover. Wire registry.to_lookup_rows into governance resolution so the
-lookup tuple shape has one definition. Guard bulk `expected` to scalar,
-closing the log()/log_dataframe divergence.
-
-Remove context.py, redundant validators, and stale docstrings.
-
-PR description:
-
-## What
-Simplification pass on the logger module ahead of pipeline logging.
-
-## Changes
-- Schema read from the target Delta table at runtime (load_table_contract);
-  removes hardcoded _SCHEMA from EventLogger/ExceptionLogger.
-- run_id/task_key passed explicitly from job params; notebook-context
-  fallback; construction raises if unresolvable. context.py deleted.
-- source_table/target_table/collection_instance_id moved from constructor
-  to per-call, supporting multi-step notebooks and per-row values.
-- log_dataframe is now a single distributed write (no collect, no 100k cap).
-- Validation collapsed onto resolve_log_column; to_lookup_rows wired in;
-  scalar-expected guard added.
-- __init__.py: context exports removed, examples corrected.
-
-## Caller-facing breaking changes
-- for_task(run_id=, task_key=) — collection/source/target now per log call.
-- log_dataframe returns None (was a row count); no oversized-input ValueError.
-- Blank run_id/task_key raises at construction.
-
-## Verification
-- [ ] grep clean: no RunContext/build_run_context/old for_task signature
-- [ ] unit suite green (row-limit/buffer-after-df tests removed)
-- [ ] events + exceptions log tables exist in target env
-
-## Not included
-PipelineLogger (follow-up PR, depends on this).
+from config_models.variable_config import VariableConfig
+from functools import reduce
+from typing import Optional
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    array_sort,
+    col,
+    element_at,
+    expr,
+    explode,
+    filter as spark_filter,
+    from_json,
+    length,
+    lit,
+    map_keys,
+    posexplode,
+    transform,
+    trim,
+)
+from pyspark.sql.types import ArrayType, MapType, StringType
+from transformations.abstract_transformation import AbstractTransformation
 
 
-
-PR 2 — Pipeline logger
-Branch: feat/pipeline-logger (cut from refactor/logger-module)
-Title: feat(logger): add PipelineLogger for final run-status records
-Commit message:
-
-feat(logger): add PipelineLogger for pipeline_run
-
-Write one final-status row per pipeline/job run to pipeline_run. Caller
-owns status and record_count; run_id/job_id/trigger_type/start_time/
-parent_run_id fall back to notebook context when not passed.
-
-Composes base_logger helpers rather than extending BaseLogger — single
-row, no buffer. run_id validated at construction (fails at for_pipeline,
-not inside the caller's except-block log()); status validated at log().
-log() is idempotent per instance.
-
-Depends on refactor/logger-module.
+# YAML type → Spark SQL type for ANSI-safe try_cast.
+_TRY_CAST_TYPES = {
+    "int": "int",
+    "integer":   "int",
+    "tinyint":   "tinyint",
+    "short":     "smallint",
+    "long":      "bigint",
+    "timestamp": "timestamp",
+}
 
 
-PR description:
+_CAST_FAILURE_TYPES = tuple(
+    sorted({f"cast_{sql_type}" for sql_type in _TRY_CAST_TYPES.values()})
+)
 
-## What
-Adds PipelineLogger — one final-status record per pipeline/job run.
 
-## Depends on
-#<PR-1>. Imports clean_string/load_table_contract/get_notebook_run_context/
-align_record_to_schema from the refactored base_logger. Merge after PR 1.
+class Parsing(AbstractTransformation):
+    def __init__(self, spark, config_file: str):
+        super().__init__(spark, config_file)
 
-## Design
-- Composition over inheritance: single-row writer, no buffering needed.
-- Intended caller pattern (per architect):
-    p = PipelineLogger.for_pipeline(...)
+    # ──────────────────────────────────────────────────────────────
+    # Expression formats can be anything in the left column and then
+    # gets rewrite to the expression in the right column
+    #   data:a              → data_json['a']
+    #   data:a:b:c          → get_json_object(data_json['a'], '$.b.c')
+    #   loop_x:y:z          → get_json_object(loop_x_json['y'], '$.z')
+    # ──────────────────────────────────────────────────────────────
+    def _rewrite_json_expression(self, expression: str, json_scopes: set) -> str:
+        # Fast exit for when ":" not in expression
+        if ":" not in expression:
+            return expression
+
+        parts = expression.split(":")
+        scope = parts[0]
+        keys = parts[1:]
+
+        # Only rewrite known JSON scopes
+        if scope not in json_scopes:
+            return expression
+
+        # Base map access
+        base = f"{scope}_json['{keys[0]}']"
+
+        # Simple access: data:key
+        if len(keys) == 1:
+            return base
+
+        # Nested JSON inside string → get_json_object
+        json_path = ".".join(keys[1:])
+        return f"get_json_object({base}, '$.{json_path}')"
+
+
+    # Build a Spark column from variable config (non-explode only)
+    def _build_column(self, variable: VariableConfig, json_scopes: set):
+        name = variable.name
+        var_type = variable.type
+        normalized_var_type = "".join((var_type or "").lower().split())
+
+        alias = getattr(variable, "alias", None)
+        expression = getattr(variable, "expression", None)
+
+        # Explode expressions handled earlier
+        if expression and expression.startswith(("explode:", "posexplode:")):
+            return None
+
+        ordered_map_values = False
+        expression_to_rewrite = expression
+        if expression and expression.startswith("ordered_map_values:"):
+            ordered_map_values = True
+            expression_to_rewrite = expression[len("ordered_map_values:"):]
+
+        # ── Expression
+        if expression_to_rewrite:
+            spark_expr = self._rewrite_json_expression(expression_to_rewrite, json_scopes)
+            col_expr = expr(spark_expr)
+            expr_str = spark_expr  # Track the original SQL string
+
+        elif alias:
+            col_expr = col(alias)
+            expr_str = alias
+
+        else:
+            raise ValueError(
+                f"Variable '{name}' must define either 'expression' or 'alias'"
+            )
+
+        # ── Type casting
+        if normalized_var_type == "string":
+            col_expr = col_expr.cast("string")
+        elif normalized_var_type in _TRY_CAST_TYPES:
+            sql_type = _TRY_CAST_TYPES[normalized_var_type]
+            col_expr = expr(self._safe_cast_sql(expr_str, sql_type))
+        elif normalized_var_type == "array<string>":
+            if ordered_map_values:
+                # Convert JSON object text like {"1":"Indian","2":"Australian"}
+                # to ["Indian", "Australian"] sorted by numeric key order.
+                map_col = from_json(expr(expr_str), MapType(StringType(), StringType()))
+                sorted_numeric_keys = array_sort(
+                    spark_filter(
+                        transform(map_keys(map_col), lambda key: key.cast("int")),
+                        lambda key: key.isNotNull(),
+                    )
+                )
+                col_expr = transform(
+                    sorted_numeric_keys,
+                    lambda key: element_at(map_col, key.cast("string")),
+                )
+            else:
+                # Mirror SQL behavior: from_json(data:...:true, 'array<string>').
+                col_expr = from_json(expr(expr_str), ArrayType(StringType()))
+        else:
+            raise ValueError(
+                f"Unsupported type {var_type!r} for variable {name!r}."
+            )
+
+        return col_expr.alias(name)
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _nonblank(column_expression):
+        """
+        Column predicate: value is not null and not empty after trimming.
+        """
+        return column_expression.isNotNull() & (
+            length(trim(column_expression.cast("string"))) > 0
+        )
+
+
+    @staticmethod
+    def _safe_cast_sql(raw_sql_expression: str, sql_type: str) -> str:
+        """
+        Build the canonical ANSI-safe casting expression used by parsing.
+
+        Rules:
+        - Cast the raw expression to string first
+        - Trim whitespace
+        - Remove thousands separators
+        - Treat blank string as NULL
+        - Use try_cast so malformed values return NULL rather than throwing
+        """
+        return (
+            "try_cast("
+            f"nullif(replace(trim(cast(({raw_sql_expression}) as string)), ',', ''), '') "
+            f"as {sql_type}"
+            ")"
+        )
+
+
+    def _failure_columns(self, *, variable_name: str, failure_type: str, message: str):
+        return [
+            col("collectionInstance").cast("string").alias("collectionInstance"),
+            col("responseId").cast("string").alias("responseId"),
+            col("caseId").cast("string").alias("caseId"),
+            lit(variable_name).alias("variable_name"),
+            lit(failure_type).alias("failure_type"),
+            lit(message).alias("message"),
+        ]
+
+
+    def _get_json_input_columns(self) -> set:
+        """
+        Names of input variables declared as type: json in YAML.
+        """
+        return {
+            input_variable.name
+            for input_dataset in self._transform_config.input_datasets
+            for input_variable in (input_dataset.variables or [])
+            if getattr(input_variable, "type", None) == "json"
+        }
+
+
+    def _get_explode_specs(self) -> list:
+        """
+        Collect explode / posexplode specs from output variables.
+        """
+        output_vars = self._transform_config.output_datasets[0].variables
+        explode_specs = []
+
+        for output_variable in output_vars:
+            expression = getattr(output_variable, "expression", None)
+            if not expression:
+                continue
+
+            if expression.startswith(("explode:", "posexplode:")):
+                explode_type, scope, path = expression.split(":", 2)
+                explode_specs.append(
+                    {
+                        "name": output_variable.name,
+                        "explode_type": explode_type,
+                        "scope": scope,
+                        "path": path,
+                    }
+                )
+
+        return explode_specs
+
+
+    def _empty_failure_df(self) -> DataFrame:
+        """
+        Empty PIA-safe failures DataFrame.
+        """
+        return self.spark.createDataFrame(
+            [],
+            """
+            collectionInstance string,
+            responseId string,
+            caseId string,
+            variable_name string,
+            failure_type string,
+            message string
+            """,
+        )
+
+
+    def _get_input_pk_columns(self) -> tuple[str, ...]:
+        """
+        Return source/input primary key columns declared in the input YAML.
+
+        These columns define the source record identity for parsing failure tracking,
+        failure deduplication, failed-record exclusion, and coverage checks.
+
+        The parser expects input variables to mark identity columns with:
+
+            is_pk: true
+
+        Example:
+            collectionInstance, responseId, caseId
+        """
+        input_datasets = self._transform_config.input_datasets
+
+        if not input_datasets:
+            raise ValueError("Parsing config must define at least one input dataset.")
+
+        # Current parsing jobs use the first input dataset: key=responses.
+        input_dataset = input_datasets[0]
+
+        if input_dataset.variables is None or input_dataset.include_all_variables:
+            raise ValueError(
+                "Cannot infer input primary key columns when input variables are not "
+                "explicitly defined in the YAML."
+            )
+
+        pk_columns = tuple(
+            input_variable.name
+            for input_variable in input_dataset.variables
+            if getattr(input_variable, "is_pk", False)
+        )
+
+        if not pk_columns:
+            raise ValueError(
+                f"No input primary key columns configured for input dataset "
+                f"{input_dataset.dataset!r}. Add is_pk: true to the input YAML."
+            )
+
+        return pk_columns
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Parsing
+    # ──────────────────────────────────────────────────────────────────
+
+    # Main transformation
+    def transform(self, data):
+        """
+        Parse the input batch and return both the projected output and
+        the failure observations.
+
+        Pipeline:
+            1. Parse JSON-typed input columns into map<string,string>.
+            2. Apply each YAML-declared explode.
+            3. Record one failure row per detected issue:
+                 * json_parse        — raw JSON did not parse
+                 * explode_parse     — array JSON did not parse
+                 * cast_<sql_type>   — try_cast returned NULL on non-blank input
+            4. Exclude any input row whose primary key appears in the
+               failure set, then project the configured output columns.
+
+        Args:
+            data: Dict of input DataFrames keyed by the YAML `key`
+                (e.g. {"responses": <input DataFrame>}).
+            pk_column: Name of the input column to use as the primary
+                key for failure records (e.g. "responseId" for
+                individual, "uoi" for household).
+
+        Returns:
+            (success_df, failure_df):
+                success_df: DataFrame in target-table shape, only rows
+                    that passed every check.
+                failure_df: DataFrame[response_id, variable_name,
+                    observed, failure_type], one row per failure
+                    observation, deduplicated on (response_id,
+                    variable_name, observed).
+
+        Note:
+            Returns a tuple, not a single DataFrame. Callers should
+            drive read → transform → log_failures → write explicitly
+            from the notebook
+        """
+        responses_df = data["responses"]
+        source_id_columns = self._get_input_pk_columns()
+
+        for source_id_column in source_id_columns:
+            if source_id_column not in responses_df.columns:
+                raise ValueError(
+                    f"Required source identity column {source_id_column!r} "
+                    f"not found in input DataFrame."
+                )
+
+        # 1. Parse JSON input columns
+        json_input_columns = self._get_json_input_columns()
+
+        parsed_df = responses_df
+
+        for json_column_name in json_input_columns:
+            parsed_df = parsed_df.withColumn(
+                f"{json_column_name}_json",
+                from_json(
+                    col(json_column_name).cast("string"),
+                    MapType(StringType(), StringType()),
+                ),
+            )
+
+        json_scopes = set(json_input_columns)
+
+        failure_dataframes = []
+
+        # 2. JSON parse failures — raw column non-blank but parsed result NULL
+        for json_column_name in sorted(json_input_columns):
+            failure_dataframes.append(
+                parsed_df.filter( self._nonblank(col(json_column_name)) & col(f"{json_column_name}_json").isNull() )
+                .select(
+                    *self._failure_columns(
+                        variable_name=json_column_name,
+                        failure_type="json_parse",
+                        message=(f"JSON parsing failed for input field '{json_column_name}'."
+                        ),
+                    )
+                )
+            )
+
+        # 3. Apply explode(s) and capture explode parse failures
+        exploded_df = parsed_df
+
+        for explode_spec in self._get_explode_specs():
+            name = explode_spec["name"]
+            explode_type = explode_spec["explode_type"]
+            scope = explode_spec["scope"]
+            path = explode_spec["path"]
+
+            raw_array_expr = col(f"{scope}_json").getItem(path).cast("string")
+
+            array_expr = from_json(
+                raw_array_expr,
+                ArrayType(MapType(StringType(), StringType())),
+            )
+
+            # Failure if a non-black value cannot parse as expected array.
+            explode_failure_condition = (
+                self._nonblank(raw_array_expr) & array_expr.isNull()
+            )
+
+            failure_dataframes.append(
+                exploded_df
+                .filter(explode_failure_condition)
+                .select(
+                    *self._failure_columns(
+                        variable_name=f"{scope}:{path}",
+                        failure_type="explode_parse",
+                        message=(
+                            f"Explode input '{scope}:{path}' was present but could not be "
+                            f"parsed as array<map<string,string>>."
+
+                        ),
+                    )
+                )
+            )
+
+            # Use normal explode/posexplode.
+            # Invalid source rows have already been captured in failure_dataframes.
+            if explode_type == "posexplode":
+                exploded_df = exploded_df.select(
+                    "*",
+                    posexplode(array_expr).alias(f"{name}_index", name),
+                )
+            else:
+                exploded_df = exploded_df.withColumn(
+                    name,
+                    explode(array_expr),
+                )
+
+            # Register exploded value as a new JSON scope
+            exploded_df = exploded_df.withColumn(f"{name}_json", col(name))
+            json_scopes.add(name)
+
+        output_vars = self._transform_config.output_datasets[0].variables
+
+        # 4. Cast failures — try_cast returns NULL on non-blank input
+        for output_variable in output_vars:
+            if getattr(output_variable, "internal", False):
+                continue
+
+            if output_variable.type not in _TRY_CAST_TYPES:
+                continue
+
+            expression = getattr(output_variable, "expression", None)
+            if not expression:
+                continue
+
+            # Explode driver variables are handled above
+            if expression.startswith(("explode:", "posexplode:")):
+                continue
+
+            base_expr = self._rewrite_json_expression(expression, json_scopes)
+            sql_type = _TRY_CAST_TYPES[output_variable.type]
+
+            raw_value_expr = expr(base_expr).cast("string")
+            casted_value_expr = expr(self._safe_cast_sql(base_expr, sql_type))
+
+            failure_dataframes.append(
+                exploded_df
+                .select(
+                    *source_id_columns,
+                    raw_value_expr.alias("_raw_value"),
+                    casted_value_expr.alias("_casted_value"),
+                )
+                .filter(
+                    self._nonblank(col("_raw_value"))
+                    & col("_casted_value").isNull()
+                )
+                .select(
+                    *self._failure_columns(
+                        variable_name=output_variable.name,
+                        failure_type=f"cast_{sql_type}",
+                        message=(
+                            f"Type cast failed for variable "
+                            f"'{output_variable.name}'. Expected {sql_type}."
+                        ),
+                    )
+                )
+            )
+
+        # 5. Combine and deduplicate failures (suppresses duplicates after explode)
+        if failure_dataframes:
+            failure_df = (
+                reduce( lambda left_df, right_df: left_df.unionByName(right_df), failure_dataframes )
+                .dropDuplicates( list(source_id_columns) + ["variable_name", "failure_type"] )
+            )
+        else:
+            failure_df = self._empty_failure_df()
+
+        # 6. Exclude source records that had parsing failures.
+        failed_keys_df = failure_df.select(
+            *source_id_columns
+        ).distinct()
+
+        # Use null-safe equality so failed records are excluded even if
+        # a key component is null.
+        join_condition = reduce(
+            lambda left_condition, right_condition: left_condition & right_condition,
+            [
+                exploded_df[source_id_column].eqNullSafe(
+                    failed_keys_df[source_id_column]
+                )
+                for source_id_column in source_id_columns
+            ],
+        )
+
+        clean_df = exploded_df.join(
+            failed_keys_df,
+            join_condition,
+            "left_anti",
+        )
+
+        # 7. Build final output columns
+        # Internal columns are used only for intermediate processing.
+        output_columns = [
+            col_expr
+            for output_variable in output_vars
+            if not getattr(output_variable, "internal", False)
+            if (col_expr := self._build_column(output_variable, json_scopes)) is not None
+        ]
+
+        success_df = clean_df.select(*output_columns)
+
+        return success_df, failure_df
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Public — logging
+    # ──────────────────────────────────────────────────────────────────
+
+    def log_failures(
+        self,
+        logger,
+        failure_df: DataFrame,
+        *,
+        source_table: Optional[str] = None,
+        target_table: Optional[str] = None,
+        event_type: str = "PARSING",
+    ) -> None:
+        """
+        Log parsing failures to the exceptions table via ExceptionLogger.
+        """
+
+        for failure_type in ("json_parse", "explode_parse"):
+            failure_subset = (
+                failure_df
+                .filter(col("failure_type") == failure_type)
+                .select(
+                    "collectionInstance",
+                    "responseId",
+                    "caseId",
+                    "variable_name",
+                    "message",
+                )
+            )
+
+            logger.log_dataframe(
+                failure_subset,
+                rule=failure_type,
+                event_type=event_type,
+                source_table=source_table,
+                target_table=target_table,
+                variable_name_column="variable_name",
+                response_id_column="responseId",
+                case_id_column="caseId",
+                collection_instance_id_column="collectionInstance",
+                message_column="message",
+            )
+
+        # Cast failures are logged using their specific failure_type as the rule.
+        for cast_failure_type in _CAST_FAILURE_TYPES:
+            cast_failure_df = (
+                failure_df
+                .filter(col("failure_type") == cast_failure_type)
+                .select(
+                    "collectionInstance",
+                    "responseId",
+                    "caseId",
+                    "variable_name",
+                    "message",
+                )
+            )
+
+            logger.log_dataframe(
+                cast_failure_df,
+                rule=cast_failure_type,
+                event_type=event_type,
+                source_table=source_table,
+                target_table=target_table,
+                variable_name_column="variable_name",
+                response_id_column="responseId",
+                case_id_column="caseId",
+                collection_instance_id_column="collectionInstance",
+                message_column="message",
+            )
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # Public — output PK inference
+    # ──────────────────────────────────────────────────────────────────
+
+    def infer_output_pk_columns(self) -> dict:
+        """
+        Infer output columns that map from the source record identity columns.
+        """
+        source_id_columns = self._get_input_pk_columns()
+        source_to_output_column = {}
+
+        for output_variable in self._transform_config.output_datasets[0].variables:
+            if getattr(output_variable, "internal", False):
+                continue
+
+            expression = getattr(output_variable, "expression", None)
+
+            if expression in source_id_columns:
+                source_to_output_column[expression] = output_variable.name
+
+        missing_source_columns = [
+            source_column
+            for source_column in source_id_columns
+            if source_column not in source_to_output_column
+        ]
+
+        if missing_source_columns:
+            raise ValueError(
+                "Could not infer output primary key mapping for source column(s): "
+                f"{missing_source_columns}. "
+                "Each source identity column must have a non-internal output variable "
+                "with expression equal to the source column name."
+            )
+
+        return source_to_output_column
+
+
+
+
+SPH_Survey_Data_Sourcing/src/transformations/parsing_orchestrator.py
+
+
+"""
+Common orchestration for ESS0 → ESS1 parsing jobs.
+
+This module keeps parsing notebooks thin and consistent across forms.
+
+Responsibilities:
+    * Instantiate the Parsing transformation.
+    * Check target table existence.
+    * Read source data.
+    * Run Parsing.transform() to produce success and failure DataFrames.
+    * Log row-level parsing failures.
+    * Verify no-silent-loss coverage.
+    * Check target schema for blocking mismatches.
+    * Write successfully parsed rows.
+    * Log unhandled processing errors.
+
+Notes:
+    * Row-level parsing failures are PIA-safe.
+    * Raw observed values are not logged.
+    * Schema nullability mismatches are intentionally ignored at parsing stage.
+"""
+
+from __future__ import annotations
+
+import traceback
+from typing import Dict, Optional
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+
+from transformations.parsing import Parsing
+from transformations.schema_operations import (
+    build_schema,
+    get_schema_mismatches,
+    table_exists,
+)
+from utils.logger import ExceptionLogger
+
+
+BLOCKING_SCHEMA_MISMATCH_TYPES = {
+    "missing_in_actual",
+    "data_type_mismatch",
+}
+
+
+# Some parsing jobs intentionally produce zero output rows for a valid input row.
+# Example:
+#   household/dwelling_person_parsing:
+#     One census_hsf household record can produce 0..N dwelling_person rows.
+#     Empty/null LoopPeopleHere is valid at ESS1 parsing stage and should not
+#     be treated as silent loss.
+SKIP_NO_SILENT_LOSS_CONFIG_FILES = {
+    "household/dwelling_person_parsing",
+}
+
+
+def get_source_identity_columns(flow: Parsing) -> list[str]:
+    """
+    Return input primary key columns declared in the parsing YAML.
+    """
+    return list(flow._get_input_pk_columns())
+
+
+def select_normalised_identity_keys(
+    dataframe: DataFrame,
+    source_id_columns: list[str],
+    column_mapping: Optional[Dict[str, str]] = None,
+) -> DataFrame:
+    """
+    Return a comparable source-identity key DataFrame.
+
+    Output columns are the canonical source_id_columns supplied by the caller.
+    """
+    mapping = column_mapping or {
+        source_id_column: source_id_column
+        for source_id_column in source_id_columns
+    }
+
+    return dataframe.select(
+        *[
+            F.coalesce(
+                F.col(mapping[source_id_column]).cast("string"),
+                F.lit("__NULL__"),
+            ).alias(source_id_column)
+            for source_id_column in source_id_columns
+        ]
+    ).distinct()
+
+
+def assert_required_source_identity_columns(
+    source_dataframe: DataFrame,
+    source_id_columns: list[str],
+) -> None:
+    """
+    Fail fast if any required source identity columns are missing from input.
+    """
+    missing_columns = [
+        source_id_column
+        for source_id_column in source_id_columns
+        if source_id_column not in source_dataframe.columns
+    ]
+
+    if missing_columns:
+        raise RuntimeError(
+            "Required source identity column(s) missing from input DataFrame: "
+            f"{missing_columns}."
+        )
+
+
+def assert_no_silent_loss(
+    *,
+    source_dataframe: DataFrame,
+    success_dataframe: DataFrame,
+    failure_dataframe: DataFrame,
+    flow: Parsing,
+) -> None:
+    """
+    Assert every input source record is represented either in:
+        * success_dataframe, or
+        * failure_dataframe
+
+    This prevents silent row loss during parsing.
+
+    For current census parsing jobs these are expected to be:
+        collectionInstance + responseId + caseId
+
+    Output key columns are inferred from YAML by looking for output variables
+    whose expression maps directly from each input PK column.
+    """
+    output_identity_columns = flow.infer_output_pk_columns()
+    source_id_columns = list(flow._get_input_pk_columns())
+
+    input_keys = select_normalised_identity_keys(source_dataframe, source_id_columns)
+
+
+    output_keys = select_normalised_identity_keys(
+        success_dataframe,
+        source_id_columns,
+        column_mapping={
+            source_id_column: output_identity_columns[source_id_column]
+            for source_id_column in source_id_columns
+        },
+    )
+
+
+    failure_keys = select_normalised_identity_keys(failure_dataframe, source_id_columns)
+
+    covered_keys = output_keys.unionByName(failure_keys).distinct()
+
+    missing_keys = input_keys.join(
+        covered_keys,
+        source_id_columns,
+        "left_anti",
+    )
+
+    missing_count = missing_keys.count()
+
+    if missing_count > 0:
+        raise RuntimeError(
+            f"Coverage invariant violated: {missing_count} input record(s) "
+            "are neither in the success output nor in the failure set."
+        )
+
+
+def get_blocking_schema_mismatches(
+    *,
+    spark: SparkSession,
+    table_path: str,
+    output_variables,
+) -> list[dict]:
+    """
+    Return schema mismatches that block writing at parsing stage.
+
+    Parsing stage blocks on:
+        * missing_in_actual
+        * data_type_mismatch
+
+    Parsing stage ignores:
+        * nullability_mismatch
+
+    Nullability validation is handled later during data contract validation.
+    """
+    expected_schema = build_schema(output_variables)
+    actual_schema = spark.table(table_path).schema
+
+    schema_mismatches = get_schema_mismatches(
+        actual=actual_schema,
+        expected=expected_schema,
+    )
+
+    return [
+        mismatch
+        for mismatch in schema_mismatches
+        if mismatch["mismatch_type"] in BLOCKING_SCHEMA_MISMATCH_TYPES
+    ]
+
+
+def log_schema_mismatches(
+    *,
+    logger: ExceptionLogger,
+    mismatches: list[dict],
+    source_table: Optional[str],
+    target_table: str,
+) -> None:
+    """
+    Log blocking schema mismatches.
+    """
+    for mismatch in mismatches:
+        logger.log(
+            rule="schema_mismatch",
+            event_type="PARSING",
+            source_table=source_table,
+            target_table=target_table,
+            variable_name=mismatch["column"],
+            message=(
+                f"Target table schema {mismatch['mismatch_type']} "
+                f"for column '{mismatch['column']}'. "
+                f"Expected={mismatch['expected']!r}, "
+                f"Actual={mismatch['actual']!r}. "
+                f"Target table={target_table}."
+            ),
+        )
+
+
+def log_missing_target_table(
+    *,
+    spark: SparkSession,
+    run_id: str,
+    task_key: str,
+    source_table: Optional[str],
+    target_table: str,
+) -> None:
+    """
+    Log missing target table as a file-level parsing exception.
+    """
+    with ExceptionLogger.for_task(
+        spark=spark,
+        run_id=run_id,
+        task_key=task_key,
+    ) as logger:
+        logger.log(
+            rule="file_not_found",
+            event_type="PARSING",
+            source_table=source_table,
+            target_table=target_table,
+            collection_instance_id=None,
+            message=(
+                f"Target table does not exist: {target_table}. "
+                "Create it via the upstream DDL job before running parsing."
+            ),
+        )
+
+
+def log_processing_error(
+    *,
+    spark: SparkSession,
+    run_id: str,
+    task_key: str,
+    source_table: Optional[str],
+    target_table: Optional[str],
+    stack_trace: str,
+) -> None:
+    """
+    Log unhandled parsing job error.
+    """
+    with ExceptionLogger.for_task(
+        spark=spark,
+        run_id=run_id,
+        task_key=task_key,
+    ) as logger:
+        logger.log(
+            rule="processing_error",
+            event_type="PARSING",
+            source_table=source_table,
+            target_table=target_table,
+            collection_instance_id=None,
+            message="Unhandled exception during parsing job execution.",
+            stack_trace=stack_trace,
+        )
+
+
+def run_parsing_job(
+    *,
+    spark: SparkSession,
+    config_file: str,
+    run_id: str,
+    task_key: str,
+) -> int:
+
+    """
+    Execute one ESS0 → ESS1 parsing job.
+
+    This function is intended to be called by thin Databricks notebooks.
+
+    Example:
+        run_parsing_job(
+            spark=spark,
+            config_file="individual/individual_parsing",
+        )
+
+    Args:
+        spark:
+            Active SparkSession.
+        config_file:
+            Transformation YAML path relative to the collection folder,
+            e.g.:
+                "individual/individual_parsing"
+                "dwelling/dwelling_parsing"
+                "household/household_parsing"
+                "household/dwelling_person_parsing"
+    """
+    flow = Parsing(spark, config_file)
+
+    input_dataset = flow._transform_config.input_datasets[0]
+    output_dataset = flow._transform_config.output_datasets[0]
+    output_variables = output_dataset.variables
+
+    known_failure_logged = False
+
     try:
-        ...work...
-        p.log(status="SUCCEEDED", record_count=n)
+        # ------------------------------------------------------------------
+        # 1. Ensure target table exists.
+        # ------------------------------------------------------------------
+        if not table_exists(spark, output_dataset.path):
+            log_missing_target_table(
+                spark=spark,
+                run_id=run_id,
+                task_key=task_key,
+                source_table=input_dataset.path,
+                target_table=output_dataset.path,
+            )
+
+            known_failure_logged = True
+            raise RuntimeError(
+                f"Target table {output_dataset.path} does not exist."
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Read source data.
+        # ------------------------------------------------------------------
+        data = flow.read()
+
+        if "responses" not in data:
+            raise RuntimeError(
+                f"Expected input dataset key 'responses'. "
+                f"Found keys={list(data.keys())}."
+            )
+
+        responses_dataframe = data["responses"]
+        source_id_columns = get_source_identity_columns(flow)
+
+        assert_required_source_identity_columns(responses_dataframe, source_id_columns)
+
+        # ------------------------------------------------------------------
+        # 3. Transform.
+        # ------------------------------------------------------------------
+        success_dataframe, failure_dataframe = flow.transform(data)
+
+        with ExceptionLogger.for_task(
+            spark=spark,
+            run_id=run_id,
+            task_key=task_key,
+        ) as logger:
+
+            # --------------------------------------------------------------
+            # 4. Log row-level parsing failures.
+            # --------------------------------------------------------------
+            flow.log_failures(
+                logger,
+                failure_dataframe,
+                source_table=input_dataset.path,
+                target_table=output_dataset.path,
+            )
+
+            # --------------------------------------------------------------
+            # 5. No-silent-loss coverage check.
+            # --------------------------------------------------------------
+            # Skip only for configured 1-to-0..N parsing flows.
+            # For dwelling_person, an input household can legitimately produce zero
+            # output rows when LoopPeopleHere is null, missing, or empty.
+            if config_file not in SKIP_NO_SILENT_LOSS_CONFIG_FILES:
+                assert_no_silent_loss(
+                    source_dataframe=responses_dataframe,
+                    success_dataframe=success_dataframe,
+                    failure_dataframe=failure_dataframe,
+                    flow=flow,
+                )
+
+            # --------------------------------------------------------------
+            # 6. Schema mismatch check.
+            # --------------------------------------------------------------
+            blocking_schema_mismatches = get_blocking_schema_mismatches(
+                spark=spark,
+                table_path=output_dataset.path,
+                output_variables=output_variables,
+            )
+
+            if blocking_schema_mismatches:
+                log_schema_mismatches(
+                    logger=logger,
+                    mismatches=blocking_schema_mismatches,
+                    source_table=input_dataset.path,
+                    target_table=output_dataset.path,
+                )
+
+                known_failure_logged = True
+                raise RuntimeError(
+                    f"Schema mismatch in {output_dataset.path}: "
+                    f"{len(blocking_schema_mismatches)} blocking mismatch(es)."
+                )
+
+            # --------------------------------------------------------------
+            # 7. Write successfully parsed rows.
+            # --------------------------------------------------------------
+            flow.write(success_dataframe)
+
     except Exception:
-        p.log(status="FAILED")
+        if not known_failure_logged:
+            log_processing_error(
+                spark=spark,
+                run_id=run_id,
+                task_key=task_key,
+                source_table=input_dataset.path if "input_dataset" in locals() else None,
+                target_table=output_dataset.path if "output_dataset" in locals() else None,
+                stack_trace=traceback.format_exc(),
+            )
+
         raise
-- run_id validated in __init__ so a bad config can't mask the real
-  exception in the except-block. status validated at log().
 
-## Verification
-- [ ] pipeline_run DDL merged; columns match _build_record; record_count bigint
-- [ ] test schema uses LongType for record_count
-- [ ] __init__.py exports PipelineLogger
 
-## Follow-ups (not blocking)
-- YAML↔logger schema consistency test once the table-creation module lands.
-- Optional debug log on second log() no-op.
+
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/individual_form_parsing notebook
+
+
+dbutils.widgets.text("target", "dev")
+dbutils.widgets.text("collection", "social_census")
+dbutils.widgets.text("collectionInstance", "")
+dbutils.widgets.text("responseId", "")
+dbutils.widgets.text("caseId", "")
+dbutils.widgets.text("filePath", "")
+dbutils.widgets.text("jobRunId", "")
+job_run_id = dbutils.widgets.get("jobRunId")
+dbutils.widgets.text("taskKey", "")
+task_key = dbutils.widgets.get("taskKey")
+
+
+from definitions import spark
+from transformations.parsing_orchestrator import run_parsing_job
+
+run_parsing_job(
+    spark=spark,
+    config_file="individual/individual_parsing",
+    run_id=job_run_id,
+    task_key=task_key,
+)
+
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/household_form_parsing notebook
+
+
+dbutils.widgets.text("target", "dev")
+dbutils.widgets.text("collection", "social_census")
+dbutils.widgets.text("collectionInstance", "")
+dbutils.widgets.text("responseId", "")
+dbutils.widgets.text("caseId", "")
+dbutils.widgets.text("filePath", "")
+dbutils.widgets.text("jobRunId", "")
+job_run_id = dbutils.widgets.get("jobRunId")
+dbutils.widgets.text("taskKey", "")
+task_key = dbutils.widgets.get("taskKey")
+
+
+from definitions import spark
+from transformations.parsing_orchestrator import run_parsing_job
+
+
+run_parsing_job(
+    spark=spark,
+    config_file="household/dwelling_person_parsing",
+    run_id=job_run_id,
+    task_key=task_key
+)
+
+
+run_parsing_job(
+    spark=spark,
+    config_file="household/household_parsing",
+    run_id=job_run_id,
+    task_key=task_key
+)
+
+
+
+SPH_Survey_Data_Sourcing/src/notebooks/dwelling_form_parsing notebook
+
+
+dbutils.widgets.text("target", "dev")
+dbutils.widgets.text("collection", "social_census")
+dbutils.widgets.text("collectionInstance", "")
+dbutils.widgets.text("responseId", "")
+dbutils.widgets.text("caseId", "")
+dbutils.widgets.text("filePath", "")
+dbutils.widgets.text("jobRunId", "")
+job_run_id = dbutils.widgets.get("jobRunId")
+dbutils.widgets.text("taskKey", "")
+task_key = dbutils.widgets.get("taskKey")
+
+from definitions import spark
+from transformations.parsing_orchestrator import run_parsing_job
+
+run_parsing_job(
+    spark=spark,
+    config_file="dwelling/dwelling_parsing",
+    run_id=job_run_id,
+    task_key=task_key
+)
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/config.yml
+
+name: social_census
+valid_environments:
+  - dev
+  - tst1
+  - uat1
+steady_states:
+  - name: ess1
+    is_external: true
+    datasets:
+      - census_df
+      - census_hsf
+      - census_if
+  - name: reference_data
+    datasets:
+      - aria_classification
+      - aria_synonym
+      - aria_concordance
+      - op_frame # census_operational_frame
+  - name: parsing
+    datasets:
+      - individual
+      - dwelling
+      - household
+      - dwelling_person
+  - name: validated
+    datasets:
+      - individual
+      - dwelling
+      - household
+  - name: aria_classify
+    datasets:
+      - date_of_birth
+      - ethnicity
+      - ur_address
+      - sex_at_birth
+  - name: classified
+    datasets:
+      - individual
+      - individual_para
+      - dwelling
+      - household
+      - operational_frame
+  - name: admin_linked
+    datasets:
+      - individual
+        - dwelling
+        - household
+        - admin_id_concordance
+        - admin_linking_log
+  - name: de_identified
+    datasets:
+      - individual
+      - dwelling
+      - household
+  - name: logs
+    datasets:
+      - pipeline_run
+      - events
+      - exceptions
+sand_box_steady_states:
+  - parsing
+  - validated
+  - aria_classify
+  - classified
+  - logs
+root_names:
+  catalog_prefix: socpophousdata1_
+  external_catalog_prefix: social_census_
+  external_schema_prefix: census_survey_
+overrides:
+  catalog:
+    - environment: dev
+      steady_state: ess1
+      use_catalog: socpophousdata1_dev
+    - environment: tst1
+      steady_state: ess1
+      use_catalog: socpophousdata1_tst1
+  schema:
+    - steady_state: ess1
+      use_schema: census_survey_ess1
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/individual/individual_parsing.yml
+
+
+
+
+name: ESS1
+input_variables:
+  - steady_state: ess1
+    dataset: census_if
+    key: responses
+    variables:
+    # ── Spec: Metadata Mapping ───────────────────────────────────────────────
+    - name: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: uoi                   # Mandatory | string | len 7–14
+      type: string
+
+    - name: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: _rescued_data         # Optional | string (failed JSON parse rows)
+      type: string
+
+    - name: caseId                # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: sourceSubmittedAt     # Mandatory | string | len 21
+      type: string
+
+    - name: metadata              # Optional | string (JSON – contains collectionMode)
+      type: json
+
+    - name: data                  # Mandatory | string (raw JSON blob)
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+
+output_variables:
+  - dataset: individual
+    steady_state: parsing
+    variables:
+    # ── Spec: Metadata Mapping ───────────────────────────────────────────────
+    - name: person_nbr            # Mandatory | string | len 18 | from responseId
+      expression: responseId
+      type: string
+      is_pk: true
+
+    - name: i_dwell_nbr           # Mandatory | string | len 7–14 | from uoi
+      expression: uoi
+      type: string
+
+    - name: collection_instance   # Mandatory | string | from collectionInstance
+      expression: collectionInstance
+      type: string
+      is_pk: true
+
+    - name: _rescued_data          # Optional | string | from _rescued_data
+      expression: _rescued_data
+      type: string
+
+    - name: i_id                  # Mandatory | string | len 18 | from caseId
+      expression: caseId
+      type: string
+      is_pk: true
+
+    - name: i_submitted_date_time # Mandatory | string | len 21 | from sourceSubmittedAt
+      expression: sourceSubmittedAt
+      type: timestamp
+
+    - name: i_mode                # Mandatory | string | len 5–6 | Online/Phone/Visit
+      expression: metadata:collectionMode
+      type: string
+
+    # ── Spec: Data Mapping – DART ────────────────────────────────────────────
+    - name: i_age                 # Optional | integer | 0–120 | from IF_age_calculated
+      type: short               # kept as integer: Delta does not support narrowing to tinyint on existing table
+      expression: data:IF_age_calculated
+
+    - name: i_dob_day             # Optional | numeric | 1–31 | from IF_date_of_birth.day
+      type: tinyint              # Bug fix #2: spec says Type: numeric
+      expression: data:IF_date_of_birth:day
+
+    - name: i_dob_month           # Optional | numeric | 1–12 | from IF_date_of_birth.month
+      type: tinyint               # Bug fix #2: spec says Type: numeric
+      expression: data:IF_date_of_birth:month
+
+    - name: i_dob_year            # Optional | numeric | from IF_date_of_birth.year
+      type: short               # Bug fix #2: spec says Type: numeric
+      expression: data:IF_date_of_birth:year
+
+    - name: i_gender_predefined   # Optional | string | male/female/another
+      type: array<string>
+      expression: data:IF_gender_predefined:true
+
+    - name: i_gender_text         # Optional | string | len ≤60
+      type: string
+      expression: data:IF_gender_text
+
+    - name: i_gender_ayt_code      # Optional | string (classification code) – renamed in spec v1(1)
+      type: string
+      expression: data:IF_gender_text_AYT
+
+    - name: i_ethnic_group_predefined  # Mandatory | string | semicolon-separated values
+      type: array<string>
+      expression: data:IF_ethnic_group_predefined:true
+
+    - name: i_ethnic_group_text #  {"1": "Indian", "2": "Australian"} to ["Indian", "Australian"]
+      type: array<string>
+      expression: ordered_map_values:data:IF_ethnic_group_text
+
+    - name: i_ethnic_group_ayt_1_code  # Optional | string | len ≤5 – renamed in spec v1(1)
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_1
+
+    - name: i_ethnic_group_ayt_2_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_2
+
+    - name: i_ethnic_group_ayt_3_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_3
+
+    - name: i_ethnic_group_ayt_4_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_4
+
+    - name: i_ethnic_group_ayt_5_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_5
+
+    - name: i_ethnic_group_ayt_6_code
+      type: string
+      expression: data:IF_ethnic_group_text_ayt_6
+
+    - name: i_maori_descent       # Mandatory | string | yes/no/dont_know/refused
+      type: string
+      expression: data:IF_maori_descent
+
+    - name: i_first_name_hsf       # Optional | string | len ≤60 | from IF_name.1 – renamed in spec v1(1)
+      type: string
+      expression: data:IF_name:1
+
+    - name: i_family_name_hsf      # Optional | string | len ≤30 | from IF_name.2 – renamed in spec v1(1)
+      type: string
+      expression: data:IF_name:2
+
+    - name: i_first_name_piped    # Optional | string | len ≤60 | from IF_piped_names.first
+      type: string
+      expression: data:IF_piped_names:first 
+
+    - name: i_family_name_piped   # Optional | string | len ≤30 | from IF_piped_names.family
+      type: string
+      expression: data:IF_piped_names:family
+
+    - name: i_first_names         # Optional | string | len ≤60 | from IF_names.first_names
+      type: string
+      expression: data:IF_names:first_names
+
+    - name: i_family_name        # Optional | string | len ≤30 | from IF_names.family_names
+      type: string
+      expression: data:IF_names:family_name
+
+    - name: i_name_confirmed      # Optional | string | yes/no/refused/dont_know
+      type: string
+      expression: data:IF_names_confirmed
+
+    - name: i_ur_address_confirmed # Optional | string | yes/no/refused/dont_know
+      type: string
+      expression: data:IF_ur_address_confirmed
+
+    - name: i_ur_address_predefined  # Optional | string | new_zealand/overseas
+      type: string
+      expression: data:IF_ur_address_predefined
+
+    - name: i_ur_address_text     # Optional | string | len 10–120
+      type: string
+      expression: data:IF_ur_address_text
+
+    - name: i_sex_at_birth        # Optional | string | Male/female/refused/dont_know
+      type: string
+      expression: data:IF_sex_at_birth
+
+    - name: i_country_of_birth_predefined  # Optional | string | new zealand/overseas/… (Bug fix #3)
+      type: string
+      expression: data:IF_country_of_birth_predefined
+
+    - name: i_country_of_birth_text        # Optional | string | len ≤60 (Bug fix #3)
+      type: string
+      expression: data:IF_country_of_birth_text
+
+    - name: i_country_of_birth_ayt_code     # Optional | string | len 2–5 coded – renamed in spec v1(1)
+      type: string
+      expression: data:IF_country_of_birth_text_AYT
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/household/dwelling_person_parsing.yml
+
+
+
+name: Household
+input_variables:
+  - steady_state: ess1
+    dataset: census_hsf
+    key: responses
+    variables:
+    - name: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: caseId                   # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: metadata
+      type: json
+
+    - name: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name:  sourceSubmittedAt # Mandatory | string | len 21
+      type: string
+
+    - name: uoi              # Mandatory | string | len 7–14
+      type: string
+
+    - name: data                   # Mandatory | string (raw JSON blob)
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+
+output_variables:
+  - dataset: dwelling_person
+    steady_state: parsing
+    variables:
+    # ── Metadata Mapping ────────────────────────────────────────────
+    - name: collection_instance
+      expression: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: h_id
+      expression: caseId                   # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_mode
+      expression: metadata:collectionMode
+      type: string
+
+    - name: hsf_response_id
+      expression: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_submitted_date_time
+      expression: sourceSubmittedAt # Mandatory | string | len 21
+      type: timestamp
+
+    - name: dwell_nbr
+      expression: uoi              # Mandatory | string | len 7–14 | Needs to be in both household and dwelling person datasets
+      type: string
+
+    - name: loop_people_here      
+      expression: posexplode:data:LoopPeopleHere
+      type: string
+      internal: true
+
+    - name: ref_person
+      expression: CASE WHEN loop_people_here_index = 0 THEN 1 ELSE 0 END
+      type: string
+
+    - name: loop_people_here_index
+      expression: loop_people_here_index
+      type: string
+      is_pk: true
+
+    - name: age
+      expression: loop_people_here:HSF_here_age
+      type: integer
+
+    - name: another
+      expression: loop_people_here:HSF_here_another
+      type: string
+      
+    - name: gender
+      expression: loop_people_here:HSF_here_gender:true
+      type: string
+
+    - name: family_name
+      expression: loop_people_here:HSF_here_name:family_name
+      type: string
+      
+    - name: first_names
+      expression: loop_people_here:HSF_here_name:first_names
+      type: string
+
+    - name: relationship
+      expression: loop_people_here:HSF_here_relationship
+      type: string
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/household/household_parsing.yml
+
+
+name: Household
+input_variables:
+  - steady_state: ess1
+    dataset: census_hsf
+    key: responses
+    variables:
+    - name: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: _rescued_data           # Optional | string (failed JSON parse rows)
+      type: string
+
+    - name: caseId                   # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: metadata
+      type: json
+
+    - name: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name:  sourceSubmittedAt # Mandatory | string | len 21
+      type: string
+
+    - name: uoi              # Mandatory | string | len 7–14
+      type: string
+
+    - name: data                   # Mandatory | string (raw JSON blob)
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+
+output_variables:
+  - dataset: household
+    steady_state: parsing
+    variables:
+    # ── Metadata Mapping ────────────────────────────────────────────
+    - name: collection_instance
+      expression: collectionInstance    # Mandatory | string
+      type: string
+      is_pk: true
+
+    - name: _rescued_data           # Optional | string (failed JSON parse rows)
+      expression: _rescued_data
+      type: string
+
+    - name: h_id
+      expression: caseId                   # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_mode
+      expression: metadata:collectionMode
+      type: string
+
+    - name: hsf_response_id
+      expression: responseId            # Mandatory | string | len 18
+      type: string
+      is_pk: true
+
+    - name: h_submitted_date_time
+      expression: sourceSubmittedAt # Mandatory | string | len 21
+      type: timestamp
+
+    - name: dwell_nbr
+      expression: uoi              # Mandatory | string | len 7–14 | Needs to be in both household and dwelling person datasets
+      type: string
+
+    # ── Data Mapping – DART ────────────────────────────────────────
+    - name: h_new_address          # Optional | string | len 10–120 | from HSF_new_address
+      expression: data:HSF_new_address
+      type: string
+
+    - name: h_usually_live         # Optional | string | Yes/missing | from HSF_usually_live
+      expression: data:HSF_usually_live 
+      type: string
+
+    - name: h_last_access_date     # Mandatory | string | len 19 | from HSF_lastAccessDate
+      expression: data:HSF_lastAccessDate 
+      type: timestamp
+
+    - name: h_number_of_occupants  # Mandatory | integer | 0–30 | from HSF_number_of_occupants
+      expression: data:HSF_number_of_occupants 
+      type: integer
+
+    - name: h_occupant_names       # Mandatory | string | from HSF_occupantNames (JSON object)
+      expression: ordered_map_values:data:HSF_occupantNames 
+      type: array<string>
+
+    - name: h_piped_address        # Mandatory | string | len 10–120 | from HSF_piped_address
+      expression: data:HSF_piped_address 
+      type: string
+
+    - name: h_no_ur_declaration    # Optional | string | from HSF_no_ur_declaration.true
+      expression: data:HSF_no_ur_declaration:true  
+      type: string
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
+
+
+
+
+SPH_Survey_Data_Sourcing/configuration/collections/social_census/dwelling/dwelling_parsing.yml
+
+
+
+# dwelling/parsing.yml
+name: ESS1
+input_variables:
+  - steady_state: ess1
+    dataset: census_df
+    key: responses
+    variables:
+    - name: collectionInstance
+      type: string
+      is_pk: true
+
+    - name: _rescued_data
+      type: string
+
+    - name: caseId
+      type: string
+      is_pk: true
+
+    - name: metadata
+      type: json
+
+    - name: responseId
+      type: string
+      is_pk: true
+
+    - name: sourceSubmittedAt
+      type: string
+
+    - name: uoi
+      type: string
+
+    - name: data
+      type: json
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+ 
+output_variables:
+  - steady_state: parsing
+    dataset: dwelling
+    variables:
+    # ── Metadata Mapping ───────────────────────────────────────────────
+    - name: collection_instance
+      type: string
+      expression: collectionInstance
+      is_pk: true
+
+    - name: _rescued_data
+      type: string
+      expression: _rescued_data
+
+    - name: d_id
+      type: string
+      expression: caseId
+      is_pk: true
+
+    - name: d_mode
+      type: string
+      expression: metadata:collectionMode
+
+    - name: df_response_id
+      type: string
+      expression: responseId
+      is_pk: True
+
+    - name: d_submitted_date_time
+      type: timestamp
+      expression: sourceSubmittedAt
+
+    - name: dwell_nbr
+      type: string
+      expression: uoi
+
+    # ── Data Mapping ───────────────────────────────────────────────────
+    - name: d_us_live_check
+      type: string
+      expression: data:DF_us_live_check
+
+    - name: d_dwell_description_predefined
+      type: string
+      expression: data:DF_dwelling_description_predefined
+
+    - name: d_dwell_description_text
+      type: string
+      expression: data:DF_dwelling_description_text
+
+    - name: d_joined_ind
+      type: string
+      expression: data:DF_joined
+
+    - name: d_storeys
+      type: string
+      expression: data:DF_storeys
+
+    - name: d_owned_or_family_trust
+      type: string
+      expression: data:DF_dwelling_ownership
+
+    - name: d_mortgage_payments
+      type: string
+      expression: data:DF_mortgage_payments
+
+    - name: d_sector_of_landlord
+      type: string
+      expression: data:DF_sector_of_landlord
+
+    - name: d_rent_ind
+      type: string
+      expression: data:DF_rent
+
+    - name: d_rent_amount
+      type: integer
+      expression: data:DF_rent_details_amount:amount
+
+    - name: d_rent_period_predefined
+      type: string
+      expression: data:DF_rent_details_period_predefined
+
+    - name: d_rent_period_text
+      type: string
+      expression: data:DF_rent_details_period_text
+
+    - name: d_bedroom_count
+      type: tinyint
+      expression: data:DF_rooms:bedroom_count
+
+    - name: d_conservatory_count
+      type: tinyint
+      expression: data:DF_rooms:conservatory_count
+
+    - name: d_dining_room_count
+      type: tinyint
+      expression: data:DF_rooms:dining_room_count
+
+    - name: d_kitchen_room_count
+      type: tinyint
+      expression: data:DF_rooms:kitchen_count
+
+    - name: d_living_room_count
+      type: tinyint
+      expression: data:DF_rooms:living_room_count
+
+    - name: d_study_room_count
+      type: tinyint
+      expression: data:DF_rooms:study_room_count
+
+    - name: d_heating_predefined
+      type: string
+      expression: data:DF_heating_predefined:true
+
+    - name: d_heating_text
+      type: string
+      expression: data:DF_heating_text
+
+    - name: d_heating_text_ayt_code
+      type: string
+      expression: data:DF_heating_text_AYT
+
+    - name: d_heating_text_ayt_other
+      type: string
+      expression: data:DF_heating_text_AYT.other$other
+
+    - name: d_telecommunication
+      type: string
+      expression: data:DF_telecommunications:true
+
+    - name: d_mobile
+      type: string
+      expression: data:DF_mobile
+
+    - name: d_telephone
+      type: string
+      expression: data:DF_telephone
+
+    - name: d_internet
+      type: string
+      expression: data:DF_internet
+
+    - name: d_motor_vehicle_count_predefined
+      type: string
+      expression: data:DF_motor_vehicle_count_predefined
+
+    - name: d_motor_vehicle_count_text
+      type: tinyint
+      expression: data:DF_motor_vehicle_count_text
+
+    - name: d_damp
+      type: string
+      expression: data:DF_dwelling_damp
+
+    - name: d_damp_always
+      type: string
+      expression: data:DF_damp_always
+
+    - name: d_mould
+      type: string
+      expression: data:DF_mould
+
+    - name: d_mould_always
+      type: string
+      expression: data:DF_mould_always
+
+    - name: d_amenities
+      type: array<string>
+      expression: data:DF_amenities:true
+
+    - name: declaration
+      type: string
+      expression: data:DF_declaration:true
+
+    - name: sys_create_date       # to be used as watermark
+      type: timestamp
+      expression: sys_create_date
+
