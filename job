@@ -1,0 +1,186 @@
+SPH_Survey_Data_Sourcing/dab/resources/jobs/cas_ess1_tableupdate_individual.job.yml
+
+
+
+resources:
+
+  jobs:
+
+    # -------------------------------------------------------
+    # Parse individual form
+    # -------------------------------------------------------
+    cas_ess1_tableupdate_individual:
+      name: "[CAS ESS1 Table Update Individual]"
+
+      parameters:
+        - name: target
+          default: ${bundle.target}
+        - name: collection
+          default: social_census
+        - name: collectionInstance
+          default: ""
+        - name: responseId
+          default: ""
+        - name: caseId
+          default: ""
+        - name: filePath
+          default: ""
+
+      trigger:
+        pause_status: UNPAUSED
+        table_update:
+          table_names:
+            - ${var.catalog}.census_survey_ess1.census_if
+
+      email_notifications:
+        on_start: []
+        on_failure: ${var.on_failure_emails}
+
+      tasks:
+        - task_key: parse_individual_form
+          notebook_task:
+            notebook_path: "${workspace.root_path}/files/src/notebooks/individual_form_parsing"
+            source: WORKSPACE
+            base_parameters:
+              target: "{{job.parameters.target}}"
+              collection: "{{job.parameters.collection}}"
+              collectionInstance: "{{job.parameters.collectionInstance}}"
+              responseId: "{{job.parameters.responseId}}"
+              caseId: "{{job.parameters.caseId}}"
+              filePath: "{{job.parameters.filePath}}"
+
+      queue:
+        enabled: true
+
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: ${var.job_environment_version}
+
+      performance_target: PERFORMANCE_OPTIMIZED
+
+
+
+
+SPH_Survey_Data_Sourcing/dab/resources/jobs/cas_ess1_tableupdate_household.job.yml
+
+
+resources:
+
+  jobs:
+
+    # -------------------------------------------------------
+    # Parse household form
+    # -------------------------------------------------------
+    cas_ess1_tableupdate_household:
+      name: "[CAS ESS1 Table Update Household]"
+
+      parameters:
+        - name: target
+          default: ${bundle.target}
+        - name: collection
+          default: social_census
+        - name: collectionInstance
+          default: ""
+        - name: responseId
+          default: ""
+        - name: caseId
+          default: ""
+        - name: filePath
+          default: ""
+
+      trigger:
+        pause_status: UNPAUSED
+        table_update:
+          table_names:
+            - ${var.catalog}.census_survey_ess1.census_hsf
+
+      email_notifications:
+        on_start: []
+        on_failure: ${var.on_failure_emails}
+
+      tasks:
+        - task_key: parse_household_form
+          notebook_task:
+            notebook_path: "${workspace.root_path}/files/src/notebooks/household_form_parsing"
+            source: WORKSPACE
+            base_parameters:
+              target: "{{job.parameters.target}}"
+              collection: "{{job.parameters.collection}}"
+              collectionInstance: "{{job.parameters.collectionInstance}}"
+              responseId: "{{job.parameters.responseId}}"
+              caseId: "{{job.parameters.caseId}}"
+              filePath: "{{job.parameters.filePath}}"
+
+      queue:
+        enabled: true
+
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: ${var.job_environment_version}
+
+      performance_target: PERFORMANCE_OPTIMIZED
+
+
+
+
+SPH_Survey_Data_Sourcing/dab/resources/jobs/cas_ess1_tableupdate_dwelling.job.yml
+
+
+resources:
+
+  jobs:
+
+    # -------------------------------------------------------
+    # Parse dwelling form
+    # -------------------------------------------------------
+    cas_ess1_tableupdate_dwelling:
+      name: "[CAS ESS1 Table Update Dwelling]"
+
+      parameters:
+        - name: target
+          default: ${bundle.target}
+        - name: collection
+          default: social_census
+        - name: collectionInstance
+          default: ""
+        - name: responseId
+          default: ""
+        - name: caseId
+          default: ""
+        - name: filePath
+          default: ""
+
+      trigger:
+        pause_status: UNPAUSED
+        table_update:
+          table_names:
+            - ${var.catalog}.census_survey_ess1.census_df
+
+      email_notifications:
+        on_start: []
+        on_failure: ${var.on_failure_emails}
+
+      tasks:
+        - task_key: parse_dwelling_form
+          notebook_task:
+            notebook_path: "${workspace.root_path}/files/src/notebooks/dwelling_form_parsing"
+            source: WORKSPACE
+            base_parameters:
+              target: "{{job.parameters.target}}"
+              collection: "{{job.parameters.collection}}"
+              collectionInstance: "{{job.parameters.collectionInstance}}"
+              responseId: "{{job.parameters.responseId}}"
+              caseId: "{{job.parameters.caseId}}"
+              filePath: "{{job.parameters.filePath}}"
+
+      queue:
+        enabled: true
+
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: ${var.job_environment_version}
+
+      performance_target: PERFORMANCE_OPTIMIZED
