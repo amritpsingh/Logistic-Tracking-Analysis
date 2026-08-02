@@ -1,146 +1,188 @@
-SPH_Survey_Data_Sourcing/src/transformations/abstract_transformation.py
-SPH_Survey_Data_Sourcing/src/transformations/names_processing/household_names.py
-SPH_Survey_Data_Sourcing/src/transformations/names_processing/individual_names.py
-SPH_Survey_Data_Sourcing/src/names_processing/name_normaliser.py
-SPH_Survey_Data_Sourcing/src/names_processing/name_processing_models.py
-SPH_Survey_Data_Sourcing/src/names_processing/name_processor.py
-SPH_Survey_Data_Sourcing/src/names_processing/names_processing_base.py
+validate_data_contract notebook
+
+dbutils.widgets.text("target", "")  # Target environment - dev, tst, uat or prd
+target = dbutils.widgets.get("target")
+
+dbutils.widgets.text("schema", "social_census_validated")  # Target schema - defaults to social_census_validated, widget present to facilitate testing.
+schema = dbutils.widgets.get("schema")
+
+dbutils.widgets.text("collection", "")  # Name of the Collection - e.g. social_census
+collection = dbutils.widgets.get("collection")
+
+dbutils.widgets.text("dataContract", "")  # Data contract to validate - e.g. individual_ess1.yml
+dataContract = dbutils.widgets.get("dataContract")
+
+# Databricks Job related parameters for Pipeline Logging
+# For manual runs, pass "jobRunId" and "taskKey" parameters to avoid errors
+from definitions import CONFIGS_DIR, spark
+from utils.props_resolver import (
+    ensure_job_context_widgets,
+    get_job_context_parameters,
+)
+
+ensure_job_context_widgets()
+
+catalog = f"socpophousdata1_{target}"
 
 
-
-SPH_Survey_Data_Sourcing/configuration/collections/social_census/names_processing/household_names.yml
-
-
-name: ss_names_processing_household
-
-input_variables:
-  - steady_state: validated
-    dataset: dwelling_person
-    key: dwelling_person
-    variables:
-      - name: hsf_response_id
-        type: string
-        is_pk: true
-
-      - name: h_id
-        type: string
-        is_pk: true
-
-      - name: collection_instance
-        type: string
-        is_pk: true
-
-      - name: ref_person
-        type: string
-        is_pk: true
-
-      - name: first_names
-        type: string
-
-      - name: family_name
-        type: string
-
-      - name: sys_create_date
-        type: timestamp
-
-output_variables:
-  - steady_state: names_processed
-    dataset: household_names
-    variables:
-      - name: hsf_response_id
-        type: string
-        is_pk: true
-
-      - name: h_id
-        type: string
-        is_pk: true
-
-      - name: collection_instance
-        type: string
-        is_pk: true
-
-      - name: ref_person
-        type: string
-        is_pk: true
-
-      - name: d_parsed_first_name
-        type: string
-
-      - name: d_parsed_last_name
-        type: string
-
-      - name: d_parsed_first_name_full
-        type: string
-
-      - name: sys_create_date
-        type: timestamp
+import os
+from datetime import datetime, timezone
+from utils.data_contracts_validation import *
+from utils.logger import ExceptionLogger, PipelineLogger
 
 
+data_contract_file_path = f"{CONFIGS_DIR}/collections/{collection}/data_contracts/{dataContract}"
+
+source_table_name_fq, _ = retrieve_from_contract_definition(
+    data_contract_file_path,
+    target
+)
+
+table_name = source_table_name_fq.split('.')[-1]
+target_table_name_fq = f"{catalog}.{schema}.{table_name}"
 
 
-SPH_Survey_Data_Sourcing/configuration/collections/social_census/names_processing/individual_names.yml
+job_context = get_job_context_parameters()
+job_run_id = job_context["job_run_id"] if job_context["job_run_id"] else "manual"
+temp_view_name = f"{table_name}_{job_run_id}_temp_view"
+temp_contract_file_path = f"/tmp/{table_name}_{job_run_id}_data_contract.yml"
 
-name: ss_names_processing_individual
+print(f"Data contract: {dataContract}")
+print(f"Source table: {source_table_name_fq}")
+print(f"Target table: {target_table_name_fq}")
+print(f"Temp view: {temp_view_name}")
+print(f"Temp contract: {temp_contract_file_path}")
 
-input_variables:
-  - steady_state: validated
-    dataset: individual
-    key: individual
-    variables:
-      - name: person_nbr
-        type: string
-        is_pk: true
 
-      - name: i_id
-        type: string
-        is_pk: true
+watermarked_records_df = None
+valid_records_df = None
+row_violations_df = None
+schema_violations_df = None
+temp_data_contract_file_path = str()
 
-      - name: collection_instance
-        type: string
-        is_pk: true
+status = "SUCCEEDED"
+logged_count = 0
 
-      - name: i_first_name_hsf
-        type: string
+try:
+    watermarked_records_df = extract_watermarked_records_df(
+        source_table_name_fq,
+        target_table_name_fq,
+        spark
+    )
 
-      - name: i_family_name_hsf
-        type: string
+    subset_count = watermarked_records_df.count()
+    print(f"Subset records to process: {subset_count}")
 
-      - name: i_first_names
-        type: string
+    if subset_count != 0:
+        rule_violations = extract_all_violations(
+            data_contract_file_path,
+            watermarked_records_df,
+            target,
+            spark
+        )
 
-      - name: i_family_name
-        type: string
+        if len(rule_violations) == 0:
+            print("Data quality validation succeeded.")
+        else:
+            print("Data quality validation failed.")
 
-      - name: i_name_confirmed
-        type: string
+            row_violations_df = extract_row_violations_df(
+                rule_violations,
+                data_contract_file_path,
+                watermarked_records_df,
+                target,
+                spark
+            )
 
-      - name: sys_create_date
-        type: timestamp
+            schema_violations_df = extract_schema_violations_df(
+                rule_violations,
+                spark
+            )
 
-output_variables:
-  - steady_state: names_processed
-    dataset: individual_names
-    variables:
-      - name: person_nbr
-        type: string
-        is_pk: true
+            row_violation_count = row_violations_df.count()
+            schema_violation_count = schema_violations_df.count()
 
-      - name: i_id
-        type: string
-        is_pk: true
+            if schema_violation_count > 0:
+                print(f"Schema/table-level validation exception count: {schema_violation_count}")
+                schema_violations_df.groupBy(
+                    "validation_error",
+                    "validation_field"
+                ).count().orderBy("count", ascending=False).show(100, truncate=False)
 
-      - name: collection_instance
-        type: string
-        is_pk: true
+            if row_violation_count > 0:
+                print(f"Row-level validation exception count: {row_violation_count}")
+                row_violations_df.groupBy(
+                    "validation_error",
+                    "validation_field"
+                ).count().orderBy("count", ascending=False).show(100, truncate=False)
 
-      - name: i_parsed_first_name
-        type: string
+            violations_df = row_violations_df.unionByName(schema_violations_df)
+            violations_df = deduplicate_violations_df(violations_df)
 
-      - name: i_parsed_last_name
-        type: string
+            logged_count = violations_df.count()
 
-      - name: i_parsed_first_name_full
-        type: string
+            with ExceptionLogger.for_task(
+                spark=spark,
+                run_id=job_context["job_run_id"],
+                task_key=job_context["task_key"],
+            ) as exception_logger:
+                log_data_contract_violations(
+                    logger=exception_logger,
+                    violations_df=violations_df,
+                    event_type="DATACONTRACTVALIDATION",
+                    source_table=source_table_name_fq,
+                    target_table=target_table_name_fq
+                )
 
-      - name: sys_create_date
-        type: timestamp
+            print(f"Logged {logged_count} data contract validation exception(s).")
+
+            if schema_violation_count > 0:
+                raise Exception(
+                    f"Data contract validation failed with {schema_violation_count} "
+                    f"schema/table-level violation(s). "
+                    f"{row_violation_count} row-level violation(s) were also logged."
+                )
+
+        valid_records_df = extract_validated_records_df(
+            data_contract_file_path,
+            watermarked_records_df,
+            target,
+            spark
+        )
+
+        validated_count = valid_records_df.count()
+        print(f"Validated records count: {validated_count}")
+
+        write_table(
+            df=valid_records_df,
+            spark=spark,
+            table_name=target_table_name_fq,
+            run_id=job_run_id,
+        )
+
+except Exception:
+    status = "FAILED"
+    raise
+
+finally:
+    if spark.catalog.tableExists(temp_view_name):
+        spark.catalog.dropTempView(temp_view_name)
+        print(f"Dropped temp view: {temp_view_name}")
+    if os.path.exists(temp_data_contract_file_path):
+        os.remove(temp_data_contract_file_path)
+        print(f"Deleted temp contract: {temp_data_contract_file_path}")
+
+    try:
+        PipelineLogger.for_pipeline(
+            spark=spark,
+            job_context=job_context,
+            status=status,
+            record_count=logged_count,
+            end_time=datetime.now(timezone.utc),
+        ).log()
+
+    except Exception as log_exc:
+        print(f"Pipeline logging failed: {log_exc}")
+
+        if status == "SUCCEEDED":
+            raise
