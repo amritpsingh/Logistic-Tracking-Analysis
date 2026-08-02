@@ -1,0 +1,74 @@
+"""Models and constants for Census name processing."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class NameInputColumns:
+    first_names: str
+    family_name: str
+
+
+@dataclass(frozen=True)
+class NameOutputColumns:
+    first_name: str
+    last_name: str
+    first_name_full: str
+
+
+@dataclass(frozen=True)
+class NameProcessingColumns:
+    """Internal columns held only within one Spark plan."""
+
+    clean_first_names: str = "_name_clean_first_names"
+    clean_family_name: str = "_name_clean_family_name"
+    combined_name: str = "_name_combined"
+    tokens: str = "_name_tokens"
+    token_count: str = "_name_token_count"
+    lookup_prefix: str = "_name_lookup_prefix"
+    lookup_remainder: str = "_name_lookup_remainder"
+
+
+INTERNAL_COLUMNS = NameProcessingColumns()
+
+# Fixed contract between prepare_source_names and the normaliser.
+NAME_INPUT_COLUMNS = NameInputColumns(
+    first_names="_name_source_first_names",
+    family_name="_name_source_family_name",
+)
+
+TITLES: tuple[str, ...] = ("MR", "MISS", "MRS", "MS", "DR", "WIFE", "JNR", "JR")
+
+SURNAME_PREFIXES: tuple[str, ...] = (
+    "O", "MC", "MAC", "TE", "DE", "DA", "VAN", "VON", "DEN", "DER",
+    "LE", "LA", "AL", "EL", "FA", "COS", "DEL", "DES", "DI", "DU",
+)
+
+# Multi-character transliterations. translate() is 1:1 so these run first.
+LIGATURES: tuple[tuple[str, str], ...] = (
+    ("Æ", "AE"), ("Œ", "OE"), ("ß", "SS"), ("Þ", "TH"), ("Ð", "D"),
+)
+
+# Accents grouped by ASCII target so source and replacement can never drift.
+ACCENT_MAP: dict[str, str] = {
+    "A": "ĀĂĄÀÁÂÃÄÅāăąàáâãäå",
+    "C": "ÇĆČçćč",
+    "D": "ĎĐďđ",
+    "E": "ĒĔĖĘĚÈÉÊËēĕėęěèéêë",
+    "G": "Ğğ",
+    "I": "ĪĬĮİÌÍÎÏīĭįıìíîï",
+    "L": "ŁĹĽłĺľ",
+    "N": "ÑŃŇñńň",
+    "O": "ŌŎŐÒÓÔÕÖØōŏőòóôõöø",
+    "R": "ŘŔřŕ",
+    "S": "ŚŠŞśšş",
+    "T": "ŤŢťţ",
+    "U": "ŪŬŮŰŲÙÚÛÜūŭůűųùúûü",
+    "Y": "ÝŸýÿ",
+    "Z": "ŹŻŽźżž",
+}
+
+ACCENT_SOURCE = "".join(ACCENT_MAP.values())
+ACCENT_TARGET = "".join(target * len(chars) for target, chars in ACCENT_MAP.items())
+
+assert len(ACCENT_SOURCE) == len(ACCENT_TARGET)
