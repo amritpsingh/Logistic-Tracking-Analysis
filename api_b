@@ -1,271 +1,336 @@
-"""BaseLogger — buffered writer shared by EventLogger and ExceptionLogger.
+Build Module for processing household and individual names
 
-The target Delta table must already exist. The logger reads its schema at
-runtime and aligns every record to it before writing.
-"""
+Census methodology specification 
 
-from __future__ import annotations
+Clean names for linking 
 
-import json
-import logging
-from datetime import datetime, timezone
-from typing import Any, List, Optional, Tuple
+ 
 
-from pyspark.sql import Column, SparkSession, functions as F
-from pyspark.sql.types import StructType
+Descriptions 
 
-log = logging.getLogger(__name__)
+This specification is used for parsing names for linking IF/HSF purpose on the following two tables: 
 
+Census Individual frame 
 
-class TableContractError(RuntimeError):
-    """Raised when the target log Delta table is missing."""
+Census dwelling person frame.  
 
+The idea is that we will tidy up names by removing titles and any accented or special characters. Names are first concatenated, then in case where the first and middle names are joined together with no spaces, a lookup is performed using a name lookup table which is a list of common first names to see if a first name can be extracted from the concatenation of first and middle names. 
 
-def resolve_log_column(
-    df_columns: List[str],
-    *,
-    field: str,
-    const,
-    column: Optional[str],
-    required: bool = False,
-) -> Column:
-    """Return a Spark Column for a field supplied as a constant or a df column.
+ 
 
-    Single source of truth for constant-vs-column arguments in log_dataframe:
-    enforces mutual exclusivity, existence, and (optionally) presence — and
-    raises eagerly while the .select expression is being built, before any
-    Spark job runs.
-    """
-    if const is not None and column is not None:
-        raise ValueError(f"Pass either `{field}` or `{field}_column`, not both.")
-    if required and const is None and column is None:
-        raise ValueError(f"Provide `{field}` or `{field}_column`.")
-    if column is not None:
-        if column not in df_columns:
-            raise ValueError(f"Column {column!r} not in DataFrame: {df_columns}")
-        return F.col(column)
-    return F.lit(const)
+2025 field test background: 
 
+1 - Names are copied from the HSF to “If _piped names” - variable IF_piped_names: {"family": "Stag GL", "first": "Triumph"}  
 
-def load_table_contract(
-    spark: SparkSession,
-    table_path: str,
-    *,
-    table_description: str = "Log table",
-) -> Tuple[StructType, List[str], set[str]]:
-    """Validate the table exists and return (schema, field_names, field_name_set)."""
-    if not spark.catalog.tableExists(table_path):
-        raise TableContractError(
-            f"{table_description} {table_path!r} does not exist; create it via SQL script."
-        )
-    schema = spark.table(table_path).schema
-    names = schema.fieldNames()
-    return schema, names, set(names)
+and “IF_name” - variable IF_name: {"1": "Triumph", "2": "Stag GL"} 
 
+ 
 
-def align_record_to_schema(
-    record: dict,
-    *,
-    schema_field_names: List[str],
-    schema_field_name_set: set[str],
-    table_path: str,
-) -> dict:
-    """Reject keys absent from the table, fill missing columns with None, order by schema."""
-    extra = set(record) - schema_field_name_set
-    if extra:
-        raise ValueError(
-            f"Record has field(s) not in {table_path!r}: {sorted(extra)}"
-        )
-    return {name: record.get(name) for name in schema_field_names}
+2 - If the respondent says yes to confirm the names are correct – variable IF_names_confirmed: "yes" then these are the only name fields.  
 
+ 
 
-def clean_string(value: Any) -> Optional[str]:
-    """Return stripped string value, or None when value is None/blank."""
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
+3 - If they say no – variable IF_names_confirmed: "no" then there is another name field “IF_names”- variable IF_names: {"family_name": "Stag GL", "first_names": "Triumph"} 
 
+ 
 
-def get_notebook_run_context() -> dict:
-    """Databricks notebook/job context reader.
+4 - If the unit is not linked or the access code redelivered flag is set then masking occurs and the respondent is asked to enter their names on the Individual Form. “IF_names” is populated - variable IF_names: {"family_name": "Stag GL", "first_names": "Triumph"} The variable IF_names_confirmed: does not appear in the payload because this is not asked in this scenario. 
 
-    Preferred production pattern is still to pass job metadata explicitly from
-    job parameters. Returns all-None values when context is unavailable (some
-    access modes, local/pytest) — callers handle the fallback.
-    """
-    context = {
-        "run_id": None,
-        "job_id": None,
-        "job_name": None,
-        "trigger_type": None,
-        "start_time": None,
-        "end_time": None,
-        "task_key": None,
-        "task_run_id": None,
-        "parent_run_id": None,
-    }
+ 
 
-    try:
-        from databricks.sdk.runtime import dbutils
+5. When the individual data is parsed: 
 
-        ctx_json = dbutils.notebook.entry_point.getDbutils().notebook().getContext().toJson()
-        raw = json.loads(ctx_json)
-        tags = raw.get("tags", {}) or {}
+IF_name is mapped to ‘i_first_name_hsf’ and ‘i_family_name_hsf’ 
 
-        current_run_id = raw.get("currentRunId")
-        if isinstance(current_run_id, dict):
-            context["run_id"] = clean_string(current_run_id.get("id"))
-        else:
-            context["run_id"] = clean_string(current_run_id)
-        context["run_id"] = (
-            context["run_id"] or clean_string(tags.get("runId")) or clean_string(tags.get("jobRunId"))
-        )
+IF_names is mapped to ‘i_first_name and ‘i_family_name’ 
 
-        context["job_id"] = clean_string(tags.get("jobId"))
-        context["job_name"] = clean_string(tags.get("jobName"))
-        context["task_key"] = clean_string(tags.get("taskKey"))
-        context["task_run_id"] = clean_string(tags.get("idInJob"))
-        context["parent_run_id"] = clean_string(tags.get("parentRunId"))
-        context["trigger_type"] = (
-            clean_string(tags.get("triggerType")) or clean_string(tags.get("jobTriggerType"))
-        )
+ 
 
-        start_ms = clean_string(tags.get("startTimestamp"))
-        if start_ms:
-            context["start_time"] = datetime.fromtimestamp(int(start_ms) / 1000, tz=timezone.utc)
+ 
 
-    except Exception as exc:
-        log.debug("Databricks notebook run context unavailable: %s", exc)
+ 
 
-    return context
+ 
 
+ 
 
-class BaseLogger:
-    """Buffers structured records and appends them to a Delta log table."""
+For Census Individual table 
 
-    def __init__(
-        self,
-        spark: SparkSession,
-        table_path: str,
-        batch_size: int,
-        run_id: Optional[str],
-        task_key: Optional[str],
-    ):
-        if batch_size <= 0:
-            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+ 
 
-        self._run_id, self._task_key = self._resolve_identity(run_id, task_key)
+Input Table Information 
+Operational Service: OS10 
+Workspace: Survey Data Sourcing 
+Catalog: socpophousdata1_<env>  
+Schema: social_census_validated 
+Table: individual 
 
-        self._spark = spark
-        self._table_path = table_path
-        self._batch_size = batch_size
-        self._buffer: List[dict] = []
+ 
 
-        self._schema, self._schema_field_names, self._schema_field_name_set = (
-            load_table_contract(spark, table_path, table_description="Log table")
-        )
+Output Table Information 
+Operational Service: OS10 
+Workspace: Survey Data Sourcing 
+Catalog: socpophousdata1_<env>  
+Schema: social_census_names_processed 
 
-    @staticmethod
-    def _resolve_identity(run_id, task_key) -> Tuple[str, str]:
-        """Prefer passed values; only read notebook context if something is missing."""
-        run_id, task_key = clean_string(run_id), clean_string(task_key)
+Table: individual_names 
 
-        if run_id and task_key:
-            return run_id, task_key
+ 
 
-        ctx = get_notebook_run_context()
-        run_id = run_id or clean_string(ctx.get("run_id"))
-        task_key = task_key or clean_string(ctx.get("task_key"))
+Input variables 
 
-        if not run_id:
-            raise ValueError(
-                "run_id is required. Pass run_id explicitly or run inside a "
-                "Databricks Job with resolvable notebook run context."
-            )
-        if not task_key:
-            raise ValueError(
-                "task_key is required. Pass task_key explicitly or run inside a "
-                "Databricks Job with resolvable notebook run context."
-            )
+Variable Name  
 
-        return run_id, task_key
+Format 
 
-    def __enter__(self) -> "BaseLogger":
-        return self
+Classification  
 
-    def __exit__(self, exception_type, exception_value, traceback_obj) -> bool:
-        try:
-            self.flush()
-        except Exception as flush_exc:
-            if exception_value is None:
-                raise
-            log.error("Flush failed on exit for %s: %s", self._table_path, flush_exc)
-        return False
+Person_nbr 
 
-    def flush(self) -> None:
-        """Append buffered records; the buffer is cleared only after a successful write."""
-        if not self._buffer:
-            return
-        try:
-            records = [self._align(r) for r in self._buffer]
-            df = self._spark.createDataFrame(records, schema=self._schema)
-            df.write.mode("append").format("delta").saveAsTable(self._table_path)
-        except Exception as exc:
-            log.warning(
-                "Flush failed for %s (%d records retained): %s",
-                self._table_path, len(self._buffer), exc,
-            )
-            raise RuntimeError(
-                f"Failed to write {len(self._buffer)} record(s) to {self._table_path}"
-            ) from exc
-        self._buffer.clear()
+string 
 
-    @property
-    def buffer_size(self) -> int:
-        return len(self._buffer)
+N/A 
 
-    @property
-    def table_path(self) -> str:
-        return self._table_path
+i_first_name_hsf 
 
-    @property
-    def run_id(self) -> str:
-        return self._run_id
+string 
 
-    @property
-    def task_key(self) -> str:
-        return self._task_key
+N/A 
 
-    def _add_to_buffer(self, record: dict) -> None:
-        self._buffer.append(record)
-        if len(self._buffer) >= self._batch_size:
-            self.flush()
+i_family_name_hsf 
 
-    def _execution_fields(self) -> dict:
-        return {"run_id": self._run_id, "task_key": self._task_key}
+string 
 
-    def _to_table_schema(self, df):
-        """Reject extra columns, fill missing table columns with NULL, cast and order to schema."""
-        df_cols = set(df.columns)
-        extra = df_cols - self._schema_field_name_set
-        if extra:
-            raise ValueError(
-                f"DataFrame has field(s) not in target table {self._table_path!r}: {sorted(extra)}"
-            )
-        return df.select(*[
-            (F.col(f.name) if f.name in df_cols else F.lit(None)).cast(f.dataType).alias(f.name)
-            for f in self._schema.fields
-        ])
+N/A 
 
-    def _write_dataframe(self, df) -> None:
-        """Align a DataFrame to the target table schema and append it to Delta."""
-        self._to_table_schema(df).write.mode("append").format("delta").saveAsTable(self._table_path)
+i_name_confirmed 
 
-    def _align(self, record: dict) -> dict:
-        return align_record_to_schema(
-            record,
-            schema_field_names=self._schema_field_names,
-            schema_field_name_set=self._schema_field_name_set,
-            table_path=self._table_path,
-        )
+string 
+
+N/A 
+
+i_first_name 
+
+string 
+
+N/A 
+
+i_family_name 
+
+string 
+
+N/A 
+
+ 
+
+Output variables 
+
+Variable Name  
+
+Format 
+
+Classification  
+
+Person_nbr 
+
+String 
+
+N/A 
+
+i_parsed_first_name 
+
+string 
+
+N/A 
+
+i_parsed_last_name 
+
+string 
+
+N/A 
+
+i_parsed_first_name_full 
+
+string 
+
+N/A 
+
+ 
+
+Rules 
+
+The order of steps is as follows: 
+
+If i_name_confirmed = "yes" 
+
+Concatenate the i_first_name_hsf and i_family_name_hsf arguments together, delimiting with a whitespace character. 
+
+Else i_name_confirmed = "no" or missing 
+
+Concatenate the i_first_name and i_family_name arguments together, delimiting with a whitespace character. 
+
+ 
+
+On the concatenated names: 
+
+Reduce accented characters to their ascii components 
+
+Transform all lowercases into uppercases 
+
+Remove these common titles: mr, miss, mrs, ms, dr, wife, jnr, jr 
+
+Remove the word “husband” if it appears at the beginning but keep it if it appears at the end of the concatenated name 
+
+Remove anything within bracket (), and bracket itself 
+
+Remove any special characters like $%^@!&*#?, hyphen and space between hyphens, or in other words, remove anything which is not the alphabet letters a-z or ‘s 
+
+Concatenate multi-part surnames. If the following prefixes occur in the name field, and there is further text following them, then drop the white space to the right of the prefix to concatenate with the rest of name : 
+
+o, mc, mac, te, de, da, van, von, den, der, le, la, al, el, fa, cos, del, des, di, du  
+
+Remove leading and trailing white space, and replace any 2 or more spaces within the text with a single space 
+
+Split the concatenated name into a list of names by space and take the last element as the i_parsed_last_name and the other part as the i_parsed_first_name_full. Take the first element of i_parsed_first_name_full as the i_parsed_first_name.  
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+For Census Household person table 
+
+ 
+
+Input Table Information 
+Operational Service: OS10 
+Workspace: Survey Data Sourcing 
+Catalog: socpophousdata1_<env>  
+Schema: social_census_validated 
+Table: dwelling_person 
+
+ 
+
+Output Table Information 
+Operational Service: OS10 
+Workspace: Survey Data Sourcing 
+Catalog: socpophousdata1_<env>  
+Schema: social_census_names_processed 
+Table: household_names 
+
+ 
+
+Input variables 
+
+Variable Name  
+
+Format 
+
+Classification  
+
+dwell_nbr 
+
+String 
+
+N/A 
+
+first_names 
+
+string 
+
+N/A 
+
+family_name 
+
+string 
+
+N/A 
+
+ 
+
+Output variables 
+
+Variable Name  
+
+Format 
+
+Classification  
+
+d_person_nbr 
+
+string 
+
+N/A 
+
+d_parsed_first_name 
+
+string 
+
+N/A 
+
+d_parsed_last_name 
+
+string 
+
+N/A 
+
+d_parsed_first_name_full 
+
+string 
+
+N/A 
+
+ 
+
+Rules 
+
+Repeat everything in the rules above, replace the fields in the table below:  
+
+Replace this: 
+
+With this: 
+
+i_parsed_first_name 
+
+d_parsed_first_name 
+
+i_parsed_last_name 
+
+d_parsed_last_name 
+
+i_parsed_first_name_full 
+
+d_parsed_first_name_full 
+
+ 
