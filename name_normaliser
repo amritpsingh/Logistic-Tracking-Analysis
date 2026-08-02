@@ -1,0 +1,262 @@
+"""Native PySpark expressions for cleaning and parsing names for linking.
+
+No Python UDF, pandas UDF, RDD conversion, collect, or table read. Every method
+contributes expressions to one lazy plan.
+
+Rule order (methodology spec):
+  A. per field   upper, accents, brackets, hyphens, junk, titles
+  B. first names lookup split of a joined first/middle token
+  C. combined    concatenate first names + family name
+  D. combined    remove leading HUSBAND, keep trailing
+  E. combined    join surname prefixes
+  F. combined    tokenise into first / last / first_name_full
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import unicodedata
+from collections.abc import Iterable
+
+from pyspark.sql import Column, DataFrame
+from pyspark.sql import functions as F
+
+from definitions import ROOT_DIR
+from transformations.names_processing.name_processing_models import (
+    ACCENT_SOURCE,
+    ACCENT_TARGET,
+    INTERNAL_COLUMNS,
+    LIGATURES,
+    SURNAME_PREFIXES,
+    TITLES,
+    NameInputColumns,
+    NameOutputColumns,
+)
+
+_TITLE_PATTERN = rf"\b(?:{'|'.join(TITLES)})\b"
+
+# Longest first keeps the alternation unambiguous. One global pass handles chains:
+# the matcher resumes after each match, so VAN DER VELDEN joins in a single call.
+_PREFIX_PATTERN = (
+    rf"\b({'|'.join(sorted(SURNAME_PREFIXES, key=lambda p: (-len(p), p)))})\s+(?=[A-Z'])"
+)
+
+
+class NameNormaliser:
+    """Build a native Spark plan that cleans and parses name columns."""
+
+    DEFAULT_LOOKUP_FILE = os.path.join(
+        ROOT_DIR, "classifications", "names_lookup", "common_first_names_lookup.json"
+    )
+
+    def __init__(
+        self,
+        common_first_names: Iterable[str] | None = None,
+        lookup_file: str | None = None,
+    ) -> None:
+        values = (
+            common_first_names
+            if common_first_names is not None
+            else self._load_lookup(lookup_file or self.DEFAULT_LOOKUP_FILE)
+        )
+        self._common_first_names = self._prepare_lookup(values)
+        self._first_name_pattern = self._build_first_name_pattern(self._common_first_names)
+
+    @staticmethod
+    def _load_lookup(path: str) -> list[str]:
+        """Static configuration read on the driver. Never respondent data."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Common first-name lookup not found: {path}")
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                values = json.load(file)
+        except (OSError, json.JSONDecodeError) as exception:
+            raise ValueError(f"Unable to read common first-name lookup: {path}") from exception
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise ValueError("Common first-name lookup must be a JSON array of strings")
+        return values
+
+    @staticmethod
+    def _prepare_lookup(values: Iterable[str]) -> tuple[str, ...]:
+        """Apply the same accent and character rules the data receives.
+
+        Without the accent step JOSE would reduce to JOS and split JOSEPHINE.
+        """
+        cleaned = set()
+        for value in values:
+            if not value or not value.strip():
+                continue
+            folded = unicodedata.normalize("NFKD", value)
+            folded = folded.encode("ascii", "ignore").decode("ascii").upper()
+            folded = re.sub(r"[^A-Z']", "", folded)
+            if folded:
+                cleaned.add(folded)
+        return tuple(sorted(cleaned, key=lambda value: (-len(value), value)))
+
+    @staticmethod
+    def _build_first_name_pattern(values: tuple[str, ...]) -> str | None:
+        if not values:
+            return None
+        alternatives = "|".join(re.escape(value) for value in values)
+        # Group 1 is the longest matching common first name, group 2 the remainder.
+        # Requiring group 2 stops an exact lookup name being split.
+        return rf"^({alternatives})([A-Z']+)$"
+
+    # --- phase A ------------------------------------------------------------
+
+    @staticmethod
+    def _clean_field_expression(value: Column) -> Column:
+        cleaned = F.upper(F.trim(value))
+
+        for source, target in LIGATURES:
+            cleaned = F.regexp_replace(cleaned, source, target)
+        cleaned = F.translate(cleaned, ACCENT_SOURCE, ACCENT_TARGET)
+
+        # Bracketed content. Repeat for separate and simply nested groups.
+        for _ in range(3):
+            cleaned = F.regexp_replace(cleaned, r"\([^()]*\)", " ")
+        cleaned = F.regexp_replace(cleaned, r"[()]", " ")
+
+        # Hyphens join. SMITH - JONES becomes SMITHJONES so a double-barrelled
+        # surname stays one token. Splitting would promote SMITH into the first
+        # names and leave JONES as the surname, which creates false links.
+        cleaned = F.regexp_replace(cleaned, r"\s*-+\s*", "")
+
+        # Remaining unsupported characters become spaces so separate tokens are
+        # not accidentally fused. Apostrophes are retained.
+        cleaned = F.regexp_replace(cleaned, r"[^A-Z' ]+", " ")
+        cleaned = F.trim(F.regexp_replace(cleaned, r"\s+", " "))
+
+        # Titles anywhere. Word boundaries protect MSIMANGO, DRURY, ORMS.
+        cleaned = F.regexp_replace(cleaned, _TITLE_PATTERN, " ")
+        return F.trim(F.regexp_replace(cleaned, r"\s+", " "))
+
+    # --- phase B ------------------------------------------------------------
+
+    def _split_joined_first_names(self, data: DataFrame) -> DataFrame:
+        if self._first_name_pattern is None:
+            return data
+
+        internal = INTERNAL_COLUMNS
+        prefix = F.regexp_extract(F.col(internal.clean_first_names), self._first_name_pattern, 1)
+        remainder = F.regexp_extract(F.col(internal.clean_first_names), self._first_name_pattern, 2)
+        return (
+            data
+            .withColumn(internal.lookup_prefix, prefix)
+            .withColumn(internal.lookup_remainder, remainder)
+            .withColumn(
+                internal.clean_first_names,
+                F.when(
+                    (F.col(internal.lookup_prefix) != "")
+                    & (F.col(internal.lookup_remainder) != "")
+                    & ~F.col(internal.clean_first_names).contains(" "),
+                    F.concat_ws(
+                        " ",
+                        F.col(internal.lookup_prefix),
+                        F.col(internal.lookup_remainder),
+                    ),
+                ).otherwise(F.col(internal.clean_first_names)),
+            )
+            .drop(internal.lookup_prefix, internal.lookup_remainder)
+        )
+
+    # --- phases D and E -----------------------------------------------------
+
+    @staticmethod
+    def _remove_leading_husband_expression(value: Column) -> Column:
+        """Applied to the combined name so beginning means beginning of the name."""
+        return F.trim(F.regexp_replace(value, r"^(?:HUSBAND\b\s*)+", ""))
+
+    @staticmethod
+    def _join_surname_prefixes_expression(value: Column) -> Column:
+        return F.regexp_replace(value, _PREFIX_PATTERN, "$1")
+
+    # --- entry point --------------------------------------------------------
+
+    def transform(
+        self,
+        data: DataFrame,
+        input_columns: NameInputColumns,
+        output_columns: NameOutputColumns,
+    ) -> DataFrame:
+        required = (input_columns.first_names, input_columns.family_name)
+        missing = [name for name in required if name not in data.columns]
+        if missing:
+            raise ValueError(f"Required name columns not found: {', '.join(missing)}")
+
+        internal = INTERNAL_COLUMNS
+
+        result = (
+            data
+            .withColumn(
+                internal.clean_first_names,
+                self._clean_field_expression(F.col(input_columns.first_names)),
+            )
+            .withColumn(
+                internal.clean_family_name,
+                self._clean_field_expression(F.col(input_columns.family_name)),
+            )
+        )
+
+        result = self._split_joined_first_names(result)
+
+        result = result.withColumn(
+            internal.combined_name,
+            F.trim(
+                F.concat_ws(
+                    " ",
+                    F.when(F.col(internal.clean_first_names) != "", F.col(internal.clean_first_names)),
+                    F.when(F.col(internal.clean_family_name) != "", F.col(internal.clean_family_name)),
+                )
+            ),
+        )
+        result = result.withColumn(
+            internal.combined_name,
+            self._remove_leading_husband_expression(F.col(internal.combined_name)),
+        )
+        result = result.withColumn(
+            internal.combined_name,
+            self._join_surname_prefixes_expression(F.col(internal.combined_name)),
+        )
+
+        return (
+            result
+            .withColumn(
+                internal.tokens,
+                F.when(
+                    F.col(internal.combined_name) != "",
+                    F.split(F.col(internal.combined_name), r"\s+"),
+                ),
+            )
+            # size(null) is -1 or null depending on ANSI and legacy settings.
+            .withColumn(
+                internal.token_count,
+                F.coalesce(F.size(F.col(internal.tokens)), F.lit(0)),
+            )
+            .withColumn(
+                output_columns.last_name,
+                F.when(F.col(internal.token_count) >= 1, F.element_at(F.col(internal.tokens), -1)),
+            )
+            .withColumn(
+                output_columns.first_name_full,
+                F.when(
+                    F.col(internal.token_count) >= 2,
+                    F.array_join(
+                        F.slice(F.col(internal.tokens), 1, F.col(internal.token_count) - 1), " "
+                    ),
+                ),
+            )
+            .withColumn(
+                output_columns.first_name,
+                F.when(F.col(internal.token_count) >= 2, F.element_at(F.col(internal.tokens), 1)),
+            )
+            .drop(
+                internal.clean_first_names,
+                internal.clean_family_name,
+                internal.combined_name,
+                internal.tokens,
+                internal.token_count,
+            )
+        )
