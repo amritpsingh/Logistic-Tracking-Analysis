@@ -1,0 +1,92 @@
+"""Base transformation for a single-read names-processing pipeline."""
+
+from abc import abstractmethod
+from typing import cast
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+
+from transformations.abstract_transformation import AbstractTransformation
+from transformations.names_processing.name_normaliser import NameNormaliser
+from transformations.names_processing.name_processing_models import (
+    NAME_INPUT_COLUMNS,
+    NameOutputColumns,
+)
+from utils.logger.exception_logger import ExceptionLogger
+
+
+class NamesProcessingBase(AbstractTransformation):
+    """Orchestrate cleaning while each dataset supplies its own source fields."""
+
+    source_key: str
+    output_columns: NameOutputColumns
+    logs_row_exceptions = True
+    event_type = "NAMESPROCESSING"
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if getattr(cls, "__abstractmethods__", None):
+            return
+        for attribute in ("source_key", "output_columns"):
+            if not isinstance(getattr(cls, attribute, None), (str, NameOutputColumns)):
+                raise TypeError(f"{cls.__name__} must define {attribute}")
+
+    def __init__(self, *args, name_normaliser: NameNormaliser | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.name_normaliser = name_normaliser or NameNormaliser()
+
+    @abstractmethod
+    def prepare_source_names(self, source: DataFrame) -> DataFrame:
+        """Map dataset fields onto NAME_INPUT_COLUMNS."""
+        pass
+
+    def transform(self, data: dict[str, DataFrame]) -> DataFrame:
+        if self.source_key not in data:
+            raise KeyError(f"Input dataset not found: {self.source_key}")
+
+        # read() populated this dictionary once. Everything below adds to the
+        # same lazy plan, so no table is read again.
+        prepared = self.prepare_source_names(data[self.source_key])
+        result = self.name_normaliser.transform(
+            prepared,
+            input_columns=NAME_INPUT_COLUMNS,
+            output_columns=self.output_columns,
+        )
+        return result.drop(NAME_INPUT_COLUMNS.first_names, NAME_INPUT_COLUMNS.family_name)
+
+    def log_row_exceptions(self, result: DataFrame, job_context: dict) -> None:
+        """Log rows that produced no usable linking name.
+
+        Two rules, because they mean different things to a methodologist:
+        a missing surname is a parse failure, a missing first name is usually
+        a mononym or a partially recorded name.
+        """
+        last_name = F.col(self.output_columns.last_name)
+        first_name = F.col(self.output_columns.first_name)
+
+        failures = (
+            result
+            .filter(last_name.isNull() | first_name.isNull())
+            .withColumn(
+                "rule",
+                F.when(last_name.isNull(), F.lit("name_parse_failure"))
+                .otherwise(F.lit("name_single_token")),
+            )
+            .withColumn(
+                "message",
+                F.when(
+                    last_name.isNull(),
+                    F.lit("No name tokens remained after cleaning"),
+                ).otherwise(F.lit("Only one name token was parsed")),
+            )
+        )
+
+        with self.exception_logger(job_context) as logger:
+            # NOTE: confirm against the ExceptionLogger.log_dataframe signature.
+            cast(ExceptionLogger, logger).log_dataframe(
+                df=failures,
+                event_type=self.event_type,
+                variable_name=self.output_columns.last_name,
+                source_table=self._source_table(),
+                target_table=self._target_table(),
+            )
