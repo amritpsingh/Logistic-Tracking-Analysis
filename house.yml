@@ -1,0 +1,51 @@
+name: ss_names_processing_household
+
+input_variables:
+  - steady_state: validated
+    dataset: dwelling_person
+    key: dwelling_person
+    variables:
+      - name: d_person_nbr
+        alias: hsf_response_id
+        type: string
+        is_pk: true
+      - name: h_id
+        type: string
+        is_pk: true
+      - name: collection_instance
+        type: string
+        is_pk: true
+      - name: ref_person
+        type: string
+        is_pk: true
+      - name: first_names
+        type: string
+      - name: family_name
+        type: string
+      - name: sys_create_date
+        type: timestamp
+
+output_variables:
+  - steady_state: names_processed
+    dataset: household_names
+    variables:
+      - name: d_person_nbr
+        type: string
+        is_pk: true
+      - name: h_id
+        type: string
+        is_pk: true
+      - name: collection_instance
+        type: string
+        is_pk: true
+      - name: ref_person
+        type: string
+        is_pk: true
+      - name: d_parsed_first_name
+        type: string
+      - name: d_parsed_last_name
+        type: string
+      - name: d_parsed_first_name_full
+        type: string
+      - name: sys_create_date
+        type: timestamp
