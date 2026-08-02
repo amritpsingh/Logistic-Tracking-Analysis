@@ -1,0 +1,34 @@
+"""Individual name-processing transformation."""
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+
+from transformations.names_processing.name_processing_models import (
+    NAME_INPUT_COLUMNS,
+    NameOutputColumns,
+)
+from transformations.names_processing.names_processing_base import NamesProcessingBase
+
+
+class IndividualNames(NamesProcessingBase):
+    source_key = "individual"
+    output_columns = NameOutputColumns(
+        first_name="i_parsed_first_name",
+        last_name="i_parsed_last_name",
+        first_name_full="i_parsed_first_name_full",
+    )
+
+    def prepare_source_names(self, source: DataFrame) -> DataFrame:
+        # HSF-piped names are used only when the respondent confirmed them.
+        confirmed = F.lower(F.trim(F.col("i_name_confirmed"))) == "yes"
+        return (
+            source
+            .withColumn(
+                NAME_INPUT_COLUMNS.first_names,
+                F.when(confirmed, F.col("i_first_name_hsf")).otherwise(F.col("i_first_names")),
+            )
+            .withColumn(
+                NAME_INPUT_COLUMNS.family_name,
+                F.when(confirmed, F.col("i_family_name_hsf")).otherwise(F.col("i_family_name")),
+            )
+        )
