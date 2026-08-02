@@ -1,0 +1,26 @@
+"""Dwelling-person name-processing transformation."""
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+
+from transformations.names_processing.name_processing_models import (
+    NAME_INPUT_COLUMNS,
+    NameOutputColumns,
+)
+from transformations.names_processing.names_processing_base import NamesProcessingBase
+
+
+class HouseholdNames(NamesProcessingBase):
+    source_key = "dwelling_person"
+    output_columns = NameOutputColumns(
+        first_name="d_parsed_first_name",
+        last_name="d_parsed_last_name",
+        first_name_full="d_parsed_first_name_full",
+    )
+
+    def prepare_source_names(self, source: DataFrame) -> DataFrame:
+        return (
+            source
+            .withColumn(NAME_INPUT_COLUMNS.first_names, F.col("first_names"))
+            .withColumn(NAME_INPUT_COLUMNS.family_name, F.col("family_name"))
+        )
