@@ -1,99 +1,80 @@
-# SPH_Survey_Data_Sourcing/tests/unit/names_processing/test_name_processor.py
-
-from datetime import datetime, timezone
-from unittest.mock import patch
-
 import pytest
-from pyspark.sql.types import (
-    IntegerType, StringType, StructField, StructType, TimestampType,
+
+from transformations.names_processing.name_normaliser import NameNormaliser
+from transformations.names_processing.name_processing_models import (
+    NAME_INPUT_COLUMNS,
+    NameOutputColumns,
 )
 
-from tests.unit._fakes import FakeSpark
-
-_TABLE = "cat.logs.pipeline_run"
-_SCHEMA = StructType([
-    StructField("run_id", StringType(), False),
-    StructField("job_id", StringType(), True),
-    StructField("trigger_type", StringType(), True),
-    StructField("start_time", TimestampType(), True),
-    StructField("end_time", TimestampType(), True),
-    StructField("status", StringType(), False),
-    StructField("parent_run_id", StringType(), True),
-    StructField("record_count", IntegerType(), True),
-    StructField("created_timestamp_utc", TimestampType(), False),
-])
-_ALL_NONE_CTX = {k: None for k in (
-    "run_id", "job_id", "job_name", "trigger_type", "start_time",
-    "end_time", "task_key", "task_run_id", "parent_run_id",
-)}
+LOOKUP = ["John", "Mary", "Anne", "Paul", "José", "Hone"]
+OUTPUT = NameOutputColumns("first_name", "last_name", "first_name_full")
 
 
-def _spark():
-    s = FakeSpark()
-    s.catalog.register(_TABLE, _SCHEMA)
-    return s
+@pytest.fixture(scope="module")
+def normaliser():
+    return NameNormaliser(common_first_names=LOOKUP)
 
 
-def _make(spark=None, **kw):
-    from utils.logger.pipeline_logger import PipelineLogger
-    params = dict(spark=spark or _spark(), table_path=_TABLE,
-                  run_id="run-123", job_id="job-9", status="SUCCEEDED")
-    params.update(kw)
-    with patch("utils.logger.pipeline_logger.get_notebook_run_context",
-               return_value=dict(_ALL_NONE_CTX)):
-        return PipelineLogger(**params)
+def _parse(spark, normaliser, first_names, family_name):
+    df = spark.createDataFrame(
+        [(first_names, family_name)],
+        [NAME_INPUT_COLUMNS.first_names, NAME_INPUT_COLUMNS.family_name],
+    )
+    row = normaliser.transform(df, NAME_INPUT_COLUMNS, OUTPUT).collect()[0]
+    return row["first_name"], row["last_name"], row["first_name_full"]
 
 
-def _record(spark):
-    return spark.created[0].rows[0]
+@pytest.mark.parametrize(
+    "first_names,family_name,expected",
+    [
+        # spec example
+        ("Triumph", "Stag GL", ("TRIUMPH", "GL", "TRIUMPH STAG")),
+        # titles removed anywhere, not only leading
+        ("Mr John", "Smith Jr", ("JOHN", "SMITH", "JOHN")),
+        ("Mrs Mary Anne", "Jones", ("MARY", "JONES", "MARY ANNE")),
+        # husband dropped at the start of the combined name, kept at the end
+        ("Husband John", "Smith", ("JOHN", "SMITH", "JOHN")),
+        ("John", "Husband", ("JOHN", "HUSBAND", "JOHN")),
+        # accents reduced, macrons included
+        ("Hōne", "Māori", ("HONE", "MAORI", "HONE")),
+        ("José", "Núñez", ("JOSE", "NUNEZ", "JOSE")),
+        # surname prefixes joined, including chains
+        ("Jan", "van der Velden", ("JAN", "VANDERVELDEN", "JAN")),
+        ("Maria", "de la Cruz", ("MARIA", "DELACRUZ", "MARIA")),
+        ("Sean", "O Brien", ("SEAN", "OBRIEN", "SEAN")),
+        # hyphens join rather than split
+        ("Mary-Anne", "Smith-Jones", ("MARYANNE", "SMITHJONES", "MARYANNE")),
+        ("Mary - Anne", "Smith", ("MARYANNE", "SMITH", "MARYANNE")),
+        # bracketed content removed with the brackets
+        ("John (Jack)", "Smith", ("JOHN", "SMITH", "JOHN")),
+        # special characters become separators, apostrophes survive
+        ("John$%^", "O'Neill", ("JOHN", "O'NEILL", "JOHN")),
+        # joined first and middle split via the lookup
+        ("Johnpaul", "Smith", ("JOHN", "SMITH", "JOHN PAUL")),
+        # an exact lookup name is never split
+        ("John", "Smith", ("JOHN", "SMITH", "JOHN")),
+        # whitespace collapsed
+        ("  John   Paul  ", " Smith ", ("JOHN", "SMITH", "JOHN PAUL")),
+        # sparse and empty inputs
+        (None, "Smith", (None, "SMITH", None)),
+        ("John", None, (None, "JOHN", None)),
+        (None, None, (None, None, None)),
+        ("", "", (None, None, None)),
+        # everything consumed by title removal
+        ("Mr", "Dr", (None, None, None)),
+    ],
+)
+def test_parse_rules(spark, normaliser, first_names, family_name, expected):
+    assert _parse(spark, normaliser, first_names, family_name) == expected
 
 
-def test_log_writes_one_row():
-    spark = _spark()
-    _make(spark).log(record_count=42)
-    r = _record(spark)
-    assert r["run_id"] == "run-123" and r["status"] == "SUCCEEDED" and r["record_count"] == 42
-    assert spark.created[0].saved_to == _TABLE
+def test_lookup_accents_normalised():
+    # JOSÉ must fold to JOSE, otherwise JOS would split JOSEPHINE
+    prepared = NameNormaliser(common_first_names=["José"])._common_first_names
+    assert prepared == ("JOSE",)
 
 
-def test_log_is_idempotent():
-    spark = _spark()
-    lg = _make(spark)
-    lg.log()
-    lg.log(status="FAILED")
-    assert len(spark.created) == 1
-
-
-def test_status_overridable_at_log_time():
-    spark = _spark()
-    _make(spark, status=None).log(status="FAILED")
-    assert _record(spark)["status"] == "FAILED"
-
-
-def test_missing_status_raises():
-    with pytest.raises(ValueError, match="status is required"):
-        _make(status=None).log()
-
-
-def test_missing_run_id_raises():
-    with pytest.raises(ValueError, match="run_id is required"):
-        _make(run_id=None).log()
-
-
-def test_negative_record_count_raises():
-    with pytest.raises(ValueError, match="record_count cannot be negative"):
-        _make().set_record_count(-1)
-
-
-def test_record_count_none_writes_null():
-    spark = _spark()
-    _make(spark).log()
-    assert _record(spark)["record_count"] is None
-
-
-def test_end_time_defaults_to_utc_now():
-    spark = _spark()
-    before = datetime.now(timezone.utc)
-    _make(spark).log()
-    end = _record(spark)["end_time"]
-    assert end.tzinfo is not None and end >= before
+def test_missing_input_column_raises(spark, normaliser):
+    df = spark.createDataFrame([("A",)], [NAME_INPUT_COLUMNS.first_names])
+    with pytest.raises(ValueError, match="Required name columns not found"):
+        normaliser.transform(df, NAME_INPUT_COLUMNS, OUTPUT)
