@@ -1,0 +1,150 @@
+import traceback
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import cast
+
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col
+
+from config_models.collection_config import Collection
+from config_models.transformation_config import TransformationConfig
+from transformations.table_writer import write_table
+from utils.logger.event_logger import EventLogger
+from utils.logger.exception_logger import ExceptionLogger
+from utils.logger.pipeline_logger import PipelineLogger
+from utils.props_resolver import (
+    get_job_context_parameters,
+    resolve_collection,
+    resolve_target,
+)
+
+
+class AbstractTransformation(ABC):
+    # Subclasses that emit row-level exceptions set this True. The result is cached
+    # so log_row_exceptions and write share one computation of the plan.
+    logs_row_exceptions: bool = False
+
+    def __init__(
+        self,
+        spark,
+        config_file: str,
+        target=None,
+        collection: Collection | None = None,
+        event_logger: None | EventLogger = None,
+    ):
+        self.spark = spark
+        self.target = target or resolve_target()
+        self.collection = collection or resolve_collection()
+        self.event_logger = event_logger
+
+        self._transform_config = TransformationConfig(
+            collection=self.collection, environment=self.target, transformation=config_file
+        )
+
+    def read(self) -> dict[str, DataFrame]:
+        data = dict()
+        for source in self._transform_config.input_datasets:
+            df = self.spark.table(source.path)
+            if not source.include_all_variables:
+                cols = [col(v.alias).alias(v.name) for v in source.variables]
+                df = df.select(*cols)
+            data[source.key] = df
+        return data
+
+    @abstractmethod
+    def transform(self, data: dict[str, DataFrame]) -> DataFrame:
+        """Apply business transformations"""
+        pass
+
+    def write(self, df: DataFrame) -> None:
+        for output_dataset in self._transform_config.output_datasets:
+            write_table(df=df, output_dataset=output_dataset, spark=self.spark)
+
+    # --- pipeline metadata -------------------------------------------------
+
+    @property
+    def primary_source_key(self) -> str | None:
+        datasets = self._transform_config.input_datasets
+        return datasets[0].key if datasets else None
+
+    def source_record_count(self, data: dict[str, DataFrame]) -> int | None:
+        """Rows read from the primary source. Delta answers this from log stats."""
+        key = self.primary_source_key
+        if key is None or key not in data:
+            return None
+        return data[key].count()
+
+    def log_row_exceptions(self, result: DataFrame, job_context: dict) -> None:
+        """Override alongside logs_row_exceptions = True."""
+        pass
+
+    def _source_table(self) -> str | None:
+        datasets = self._transform_config.input_datasets
+        return datasets[0].path if datasets else None
+
+    def _target_table(self) -> str | None:
+        datasets = self._transform_config.output_datasets
+        return datasets[0].path if datasets else None
+
+    def _exception_log_table(self) -> str:
+        return self._transform_config.collection_config.get_table_path("exceptions", "logs")
+
+    def exception_logger(self, job_context: dict):
+        return ExceptionLogger.for_task(
+            spark=self.spark,
+            log_table_path=self._exception_log_table(),
+            run_id=job_context["job_run_id"],
+            task_key=job_context["task_key"],
+        )
+
+    # --- orchestration -----------------------------------------------------
+
+    def run(self) -> None:
+        job_context = get_job_context_parameters()
+        status = "SUCCEEDED"
+        record_count = None
+        result = None
+        cached = False
+
+        try:
+            data = self.read()
+            record_count = self.source_record_count(data)
+
+            result = self.transform(data)
+
+            if self.logs_row_exceptions:
+                result = result.cache()
+                cached = True
+                self.log_row_exceptions(result, job_context)
+
+            self.write(result)
+
+        except Exception as e:
+            status = "FAILED"
+            with self.exception_logger(job_context) as logger:
+                cast(ExceptionLogger, logger).log(
+                    rule="logic_conflict",
+                    event_type="EXCEPTION",
+                    variable_name=self._transform_config.name,
+                    source_table=self._source_table(),
+                    target_table=self._target_table(),
+                    message=str(e),
+                    stack_trace=traceback.format_exc(),
+                )
+            raise
+
+        finally:
+            if cached and result is not None:
+                result.unpersist()
+            try:
+                PipelineLogger.for_pipeline(
+                    spark=self.spark,
+                    job_context=job_context,
+                    status=status,
+                    record_count=record_count,
+                    end_time=datetime.now(timezone.utc),
+                ).log()
+            except Exception as log_exc:
+                print(f"Pipeline logging failed: {log_exc}")
+                if status == "SUCCEEDED":
+                    raise
