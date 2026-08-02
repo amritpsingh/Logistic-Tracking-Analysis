@@ -1,4 +1,4 @@
-"""Unit tests for utils.logger.pipeline_logger (fake Spark)."""
+# SPH_Survey_Data_Sourcing/tests/unit/names_processing/test_name_processor.py
 
 from datetime import datetime, timezone
 from unittest.mock import patch
