@@ -1,0 +1,1269 @@
+I created the summary using Microsoft copilot.
+this summary of project files:the repository map from its entry points, configuration, source modules, notebooks, and tests, then trace the main data flow so the summary describes what the project actually builds rather than just repeating filenames.Analyze repository architectureThe repository-wide scan is underway. I’m now checking the project’s declared entry points and deployment metadata against the source layout, which will separate implemented runtime capabilities from examples, infrastructure, and test-only support.The top-level metadata confirms this is a Databricks asset-bundle Python project with a deliberately lean runtime package and a much broader dev/runtime environment supplied through optional dependencies. I’m validating the detailed capability list against actual files now, especially the transformation, service, deployment, and job inventories.The implementation confirms the core is configuration-driven Spark ETL: YAML defines datasets and variables, parsers build Spark projections from JSON expressions, and writers persist versioned Delta rows with audit hashes. The repository also contains several domain-specific transformations beyond the scheduled jobs, so I’m checking what is wired into deployment versus what currently exists as reusable or experimental code.The inventory is now consistent: 104 Python source files, 22 Databricks job definitions, 71 YAML configuration files, and 57 test Python files, plus 17 BDD feature specifications. I’m doing one final cross-check of the repository’s documented maturity and wiring so the summary clearly labels production-oriented components, reusable transformations, demos, and unfinished areas.**Project Summary**This repository builds a Databricks-based survey data processing platform for New Zealand Census/Social Census data. It ingests raw Salesforce survey responses, parses and validates them, enriches demographic and address fields, normalizes names, and writes governed Delta tables.**End-to-end pipeline**1. Raw Salesforce data enters through external `ess1` tables: dwelling, household, and individual responses.2. Configuration-driven Spark parsers extract structured fields from JSON form data.3. Parsed records are written to Delta tables with incremental processing and SCD Type 2 history.4. Data contracts validate schemas, required fields, types, keys, and constraints.5. ARIA classifications enrich responses with:   - Date of birth   - Ethnicity   - Gender   - Sex at birth   - Māori descent   - Usual residence/address6. Additional transformations support dwelling type, rooms, storeys, landlord sector, age, languages, qualifications, and joined dwelling records.7. Names are cleaned and tokenized for later statistical/admin linking.8. Address data is geocoded through the Intech SOAP service.9. Salesforce account/case data is combined into an operational frame.10. Pipeline, event, exception, and validation failures are logged into Delta tables.The main flow is implemented across `transformations`, `services`, and `notebooks`.**Major components**- **Configuration model**: `config_models` loads and validates YAML definitions using Pydantic. It resolves collections, environments, catalogs, schemas, datasets, variables, primary keys, and transformation expressions.- **JSON form parsing**: `parsing.py` converts configured JSON paths into Spark expressions, supports nested JSON, arrays, ordered map values, exploding repeated responses, safe casts, and parse-failure output.- **Incremental Delta writing**: `table_writer.py` adds audit fields, hashes business keys and row contents, filters unchanged records, and performs SCD Type 2 merges.- **Text coding**: `coding` provides exact, fuzzy, phrase, span, predefined, numeric, single-response, and multi-response coders. It supports synonym cleanup, buffer words, ARIA classifications, residual codes, and coding paradata.- **Name processing**: `name_normaliser.py` performs Spark-native uppercase/trim cleanup, accent and ligature normalization, title and surname-prefix handling, tokenization, and common-first-name matching.- **ARIA integration**: `aria_api.py` retrieves classifications, synonyms, and concordances; flattens hierarchical ARIA codes; retries transient API failures; and stores reference data.- **Geocoding**: `geocoder.py` submits addresses to Intech via SOAP, parses XML results, calculates match quality, renames fields, and saves Delta output.- **Operational frame**: `operational_frame_service.py` joins Salesforce account and case data, filters valid dwelling types, derives address groups, calculates multiple-dwelling indicators, and writes reference data.- **Logging and diagnostics**: `logger` records pipeline runs, events, exceptions, schema violations, task metadata, and record counts.- **Database deployment**: `deployment` reads deployment YAML, generates SQL, creates schemas/tables, and executes deployment statements.**Configured data model**The Social Census collection is defined in `config.yml`. It contains:- External `ess1` source datasets- Parsing datasets- Validated datasets- ARIA classification datasets- Classified individual, dwelling, household, and operational-frame datasets- Processed name datasets- Admin-linking and ID-concordance datasets- De-identified dataset placeholders- Logging datasets- Reference data for ARIA, geocoding, and SalesforceDeployment definitions are in `social_census`, covering schemas, Delta tables, logs, reference data, validation outputs, and linking-related tables.**Databricks deployment**`databricks.yml` defines the Databricks Asset Bundle. It includes source code, configuration, tests, and job definitions while excluding local tooling and demos by default.The repository has environment targets for `dev`, `tst1`, `uat1`, and `local` under `targets`. The targets configure catalogs, Spark versions, node types, worker counts, time zones, policies, workspace hosts, and failure notifications.There are 22 job definitions under `jobs`, including:- Three raw-response parsing jobs- Four validation jobs- Six ARIA classification jobs- Two names-processing jobs- Geocoding- ARIA reference-data refresh- Salesforce operational-frame refresh- Database deployment- Smoke and integration test jobs**Notebooks and demos**The executable Databricks notebooks under `notebooks` include parsing, validation, ARIA classification, names processing, geocoding, operational-frame creation, database deployment, and accessibility checks.The `demo` directory contains examples for pipeline execution, logging, parsing, table comparison, onboarding, operational-frame processing, and unit testing. These are demonstration material rather than the deployed production workflow.**Reference assets**`classifications` contains:- Ethnic-group lookup data- Gender lookup data- Buffer-word lists- Common first-name data**Testing and tooling**The project uses pytest and pytest-bdd. Tests cover:- Coding and matching algorithms- Parsing and incremental processing- Delta table writes- Configuration loading- Database deployment- ARIA extraction- Geocoding and operational-frame services- Logging- Name processing- Data-contract validationBDD scenarios are stored in `features`, with 17 feature files covering demographic coding and dwelling transformations. Development dependencies and quality settings are declared in `pyproject.toml`, including pytest, Ruff, Black, Pydantic, PyYAML, Databricks Connect, and an 85% coverage threshold.**Current maturity and gaps**The repository is a substantial working platform, but some areas appear incomplete or only partially wired:- `README.md` still contains TODO sections for project introduction, installation details, dependencies, and data structures.- De-identification tables are configured, but no clear de-identification implementation is present.- Several transformations exist in source/configuration but do not have corresponding scheduled jobs.- MI work-item and status-history tables are deployed/configured, but their processing workflow is not obvious.- The runtime dependency list is intentionally minimal; many imports rely on Databricks or development extras.- Integration tests are present but appear partly skeletal.- Admin linking and final privacy-protected outputs look like planned downstream stages rather than fully implemented workflows.In short, this is a configuration-driven, Spark-native Census survey ETL and classification platform with strong reusable coding, validation, logging, deployment, and incremental-processing foundations.
+
+
+This repository summary is strong because it moves beyond a directory listing and explains the system’s runtime architecture and data flow. However, several statements should be tightened so the summary clearly distinguishes confirmed implementation, deployed capabilities, configurable components, and planned architecture.
+
+Analysis of the Repository Summary
+1. What the repository appears to build
+
+The repository builds a configuration-driven Databricks processing platform for Census Attribute Survey data.
+
+Its central architectural pattern is:
+
+YAML configuration
+        ↓
+Generic Spark processing components
+        ↓
+Stage-specific notebooks
+        ↓
+Databricks jobs
+        ↓
+Versioned Delta tables
+        ↓
+Logging, validation and diagnostic outputs
+
+
+Rather than implementing a separate pipeline for every census variable, the platform provides reusable engines for:
+
+JSON response parsing
+schema and data-contract validation
+incremental processing
+Delta persistence
+classification and coding
+name standardisation
+geocoding
+operational-frame creation
+logging and exception handling
+database-object deployment
+
+Variable-specific behaviour appears to be supplied primarily through YAML configuration, classification reference data and job parameters.
+
+This is an appropriate architecture for the wider CPS programme because new variables and statistical units can be onboarded without creating entirely separate processing frameworks.
+
+2. Repository architecture
+Entry and deployment layer
+
+The repository uses a Databricks Asset Bundle, with databricks.yml functioning as the primary deployment manifest.
+
+This layer appears responsible for:
+
+selecting deployment targets
+supplying environment variables
+including job definitions
+packaging notebooks, source code and configuration
+defining cluster settings
+deploying resources to Databricks workspaces
+
+The environment targets are:
+
+dev
+tst1
+uat1
+local
+
+A useful interpretation is:
+
+databricks.yml
+    ├── targets/*
+    ├── jobs/*
+    ├── notebooks/*
+    ├── src/*
+    ├── config/*
+    └── tests/*
+
+This makes the repository both an application codebase and an infrastructure/deployment unit.
+
+
+Orchestration layer
+
+The notebooks appear to be relatively thin Databricks entry points that:
+
+receive job parameters
+load configuration
+initialise the required service or transformation
+execute the processing operation
+write results
+record logs and failures
+
+That is a desirable separation. Business logic should stay in testable Python modules, while notebooks should primarily orchestrate execution.
+
+This also aligns with the recent design direction of introducing a notebook that receives a configuration path and calls the reusable processing functions.
+
+Job-definition layer
+
+The job YAML files connect the reusable code and notebooks to deployable Databricks workflows.
+
+The summary identifies jobs for:
+
+raw-response parsing
+validation
+ARIA classification
+name processing
+geocoding
+reference-data refresh
+Operational Frame refresh
+database deployment
+smoke testing
+integration testing
+
+These job definitions are important because they show which repository components are actually intended to run as deployed workflows.
+
+A source module or notebook existing in the repository does not necessarily mean it is part of the active production pipeline. The job definitions provide the clearest evidence of operational wiring.
+
+Configuration layer
+
+The configuration model appears to operate at two levels.
+
+Processing configuration
+
+This defines:
+
+collection
+environment
+catalog
+schema
+dataset
+variable
+source and target
+primary key
+transformation expression
+processing options
+Database deployment configuration
+
+This defines:
+
+schemas
+tables
+columns
+data types
+constraints
+table properties
+comments
+deployment order
+
+These two configuration types should remain separate even when they refer to the same datasets:
+
+Processing configuration
+    → how data moves and is transformed
+
+Deployment configuration
+    → which database objects must exist
+
+
+This separation reduces the risk of transformation logic becoming coupled to infrastructure generation.
+
+Core source package
+
+The runtime package appears intentionally lean and organised around several major areas:
+
+configuration models
+parsing
+transformation
+coding
+services
+table writing
+logging
+deployment
+
+The most important architectural relationship is:
+
+Config models
+    ↓
+Parsing and transformation engines
+    ↓
+Domain services and coders
+    ↓
+Table writer
+    ↓
+Delta tables
+
+Logging surrounds every stage.
+
+Tests and BDD specifications
+
+The repository has substantial automated testing coverage, including:
+
+unit tests
+integration tests
+smoke tests
+pytest-bdd feature scenarios
+
+The 17 BDD feature files are particularly useful for demographic and dwelling rules because they can describe expected statistical behaviour in business-readable language.
+
+The reported 85% coverage threshold suggests the project is aiming for a meaningful engineering quality gate. However, the threshold alone does not establish current coverage. It indicates the configured expectation, not necessarily that every branch currently passes at that level.
+
+3. Actual data flow
+
+The most important refinement is to describe the data flow using the project’s processing-state language consistently.
+
+Stage 1: Source ingestion
+
+The summary says:
+
+Raw Salesforce data enters through external ess1 tables.
+
+This needs clarification.
+
+The wider architecture describes raw survey responses arriving first in ESS0 as ingestion metadata and a JSON payload, followed by parsing into ESS1. Calling external raw-response tables “ESS1” may reflect repository naming, but it can conflict with the enterprise processing model.
+
+The summary should distinguish:
+Enterprise stage:
+ESS0 raw ingestion
+
+Repository source:
+External tables containing raw response payloads
+
+Repository output:
+ESS1 parsed statistical-unit tables
+
+
+Without that distinction, readers may conclude that the repository owns ESS0 ingestion when it may only consume ESS0 outputs.
+
+Stage 2: Parsing
+
+YAML variable definitions provide JSON paths or expressions. The parser uses these definitions to construct Spark projections.
+
+The likely flow is:
+
+Raw response JSON
+    ↓
+Configuration lookup
+    ↓
+Spark extraction expressions
+    ↓
+Type conversion and safe casting
+    ↓
+Array or repeated-response handling
+    ↓
+Individual, household or dwelling records
+    ↓
+Parse-failure output
+
+This is one of the repository’s central reusable capabilities.
+
+It allows form changes and variable onboarding to be handled primarily through configuration, provided the generic parser already supports the required structure.
+
+Stage 3: Incremental persistence
+
+The parsed result is passed to the table-writing component.
+
+The summary says the writer:
+
+adds audit fields
+generates business-key hashes
+generates row-content hashes
+removes unchanged records
+performs SCD Type 2 merges
+
+This should be described carefully. It is important to confirm whether SCD Type 2 applies to:
+
+every ESS1 dataset
+only selected configured tables
+specific historical outputs
+both parsed and validated stages
+
+A component supporting SCD Type 2 does not necessarily mean every pipeline uses it.
+
+The recent distinction between ESS1/ESS2 watermark processing and ESS3-specific incremental behaviour should also be included. The repository appears to need processing-stage-specific incremental strategies rather than one universal approach.
+
+Stage 4: Validation
+
+Parsed data then passes through the data-contract framework.
+
+The framework reportedly validates:
+
+schema
+fields
+data types
+keys
+required values
+constraints
+
+Validation should result in two conceptual outputs:
+
+Accepted records
+    → validated statistical-unit tables
+
+Rejected or non-conforming records
+    → validation failures and diagnostic logs
+
+
+The summary would be stronger if it identified whether validation is:
+
+record-level
+column-level
+dataset-level
+fail-fast
+quarantine-based
+warning-capable
+
+It should also clarify whether validated records are persisted separately or passed directly to subsequent transformations.
+
+Stage 5: Classification and transformation
+
+Validated data is processed through a mix of generic coders and domain-specific transformations.
+
+Generic coding framework
+
+The coding package provides reusable algorithms for:
+
+exact matching
+fuzzy matching
+phrase matching
+span matching
+predefined values
+numeric values
+single-response coding
+multi-response coding
+
+It also supports:
+
+synonym replacement
+buffer-word treatment
+classification reference data
+residual codes
+coding paradata
+
+This is a reusable classification engine rather than six entirely independent ARIA implementations.
+
+Configured demographic processing
+
+The deployed ARIA-related processing reportedly covers:
+
+date of birth
+ethnicity
+gender
+sex at birth
+Māori descent
+usual residence/address
+
+The address entry needs qualification. Address resolution also involves geocoding, and the architecture shows geocoding as a separate service. Therefore, the summary should avoid implying that usual residence is handled solely as an ARIA classification.
+
+A more accurate wording would be:
+
+Demographic variables are processed using ARIA classifications and generic coding components, while usual-residence data passes through address-specific preparation, classification and geocoding steps.
+
+Additional transformations
+
+Other source modules support:
+
+age
+dwelling type
+number of rooms
+number of storeys
+landlord sector
+language
+qualifications
+dwelling joins
+
+These should be categorised as one of:
+
+deployed and scheduled
+callable from an existing notebook
+reusable but not scheduled
+demonstration or prototype
+incomplete
+
+The current summary correctly notes that not every available transformation has a corresponding scheduled job. That distinction should be carried into the capability list rather than presented only under gaps.
+
+Stage 6: Name processing
+
+The name-processing component appears to:
+
+convert text into a consistent case
+trim and clean values
+normalise accents and ligatures
+treat titles
+treat surname prefixes
+tokenize names
+identify common first names
+
+The output is intended to support later statistical or administrative linking.
+
+Because names are identifying information, this subsystem should have particularly clear controls for:
+
+source-data access
+output permissions
+data retention
+logging
+use in linkage
+transition into de-identified stages
+Stage 7: Geocoding
+
+The geocoder:
+
+obtains address inputs
+creates a SOAP request
+calls the Intech service
+parses the XML response
+derives match-quality information
+standardises output column names
+writes results to Delta
+
+This is an external-service integration, so it should also have operational handling for:
+
+timeouts
+retries
+malformed responses
+no-match results
+multiple matches
+service unavailability
+request correlation
+duplicate submission
+partial reruns
+Stage 8: Operational Frame
+
+The Operational Frame service combines Salesforce Account and Case data.
+
+Its responsibilities reportedly include:
+
+joining account and case records
+filtering accepted dwelling types
+deriving address groupings
+determining multiple-dwelling indicators
+writing reference data
+
+This capability is part of reference-frame construction rather than survey-response parsing. It should therefore be represented as a parallel supporting flow:
+
+Salesforce Account and Case data
+    ↓
+Operational Frame service
+    ↓
+Cleansed and derived frame records
+    ↓
+Operational Frame reference tables
+    ↓
+Used by survey and downstream processing
+
+
+Stage 9: Observability and diagnostics
+
+Logging operates across the full process rather than only after execution.
+
+The repository supports:
+
+pipeline-run logging
+event logging
+exception logging
+validation-failure logging
+task metadata
+record counts
+
+The logs should be linked through common run and correlation identifiers so that an operator can trace:
+
+Databricks job run
+    → notebook task
+    → source version
+    → transformation
+    → target write
+    → validation failures
+    → exception
+
+4. Important consistency issues
+Job count does not reconcile
+
+The summary states that there are 22 job definitions, but the listed categories total 21:
+
+3 parsing
+4 validation
+6 ARIA classification
+2 name processing
+1 geocoding
+1 ARIA reference refresh
+1 Operational Frame refresh
+1 database deployment
+2 smoke and integration test jobs
+
+ESS naming needs alignment
+
+The summary describes raw external data as ESS1, while the wider architecture describes:
+
+ESS0: ingested raw payload
+ESS1: parsed data
+ESS2: validated data
+ESS3: coded/classified data
+ESS4: admin-linked/de-identified data
+
+Repository-local naming should be explicitly mapped to the enterprise ESS model.
+
+SCD Type 2 may be overstated
+
+The table writer may support SCD Type 2, but the summary currently suggests that all parsed records are necessarily stored using SCD Type 2.
+
+A safer formulation is:
+
+The shared table writer supports audit hashing, unchanged-record filtering and SCD Type 2 merge behaviour for configured targets.
+
+ARIA and address processing are conflated
+
+The summary lists usual residence/address as an ARIA classification alongside demographic classifications, then separately identifies geocoding.
+
+The data flow should explain how these relate. For example:
+
+Validated address
+    ↓
+Address preparation or classification
+    ↓
+Geocoder submission
+    ↓
+Match-quality evaluation
+    ↓
+Classified individual output
+
+“Governed Delta tables” needs evidence
+
+The repository clearly writes Delta tables, but “governed” may imply additional capabilities such as:
+
+Unity Catalog permissions
+ownership controls
+lineage
+tags
+classification
+retention policy
+row or column security
+
+If these are not visible in the deployment configuration, “managed Delta tables” or “configured Delta tables” would be more precise.
+
+Production status needs careful language
+
+The summary describes a substantial working platform, but several important final-state capabilities are not clearly implemented:
+
+Manual Intervention workflow
+admin linking
+de-identification
+final derivation and imputation
+privacy-protected outputs
+complete scheduled coverage for available transformations
+
+Therefore, this is better described as a production-oriented processing foundation with multiple deployed workflows, rather than as a complete end-to-end Census Processing System.
+
+5. Revised overall assessment
+
+The repository appears architecturally mature in the early and middle stages of survey processing:
+
+Source consumption
+    → parsing
+    → validation
+    → classification
+    → name processing
+    → geocoding
+    → structured Delta outputs
+
+
+It also has strong supporting foundations:
+
+configuration management
+database deployment
+reusable coding
+logging
+automated tests
+Databricks environment deployment
+
+The less mature side is the later combined-census workflow:
+
+Admin linking
+    → source precedence
+    → Manual Intervention resolution
+    → derivation
+    → imputation
+    → de-identification
+    → final annual outputs
+
+
+Copilot also provide the fit assessment based on this role as well.
+
+Amrit, your current Census Processing System project gives you a strong foundation for this Lead Data Engineer position, especially in Python pipelines, Databricks, configuration-driven engineering, data quality, CI/CD, and cross-functional delivery. Your main obstacle is not seniority or data-engineering capability. It is demonstrating credible transfer from the Azure/Databricks ecosystem to EVT’s AWS, Dagster, Snowflake, and dbt stack.
+
+1. Overall fit assessment
+Estimated fit: 70 to 80%
+
+| Area                            |            Your likely fit | Assessment                                                                       |
+| ------------------------------- | -------------------------: | -------------------------------------------------------------------------------- |
+| Python data engineering         |                     Strong | Directly demonstrated in CPS                                                     |
+| Pipeline design and maintenance |                     Strong | ESS pipelines, incremental processing, configuration-driven transformations      |
+| Data quality and testing        |                     Strong | Validation, data contracts, pytest, BDD and coverage controls                    |
+| Cloud data platform             | Strong but different stack | Databricks and Azure experience transfers, but EVT asks for AWS                  |
+| Orchestration                   |                   Moderate | Databricks Jobs and notebooks transfer conceptually, but Dagster is a gap        |
+| Infrastructure as code          |         Partial or unclear | Databricks Asset Bundles help, but CDK, Terraform and EKS need evidence          |
+| CI/CD and GitOps                |                       Good | PRs, bundle deployment, environment targets and version-controlled configuration |
+| Cloud warehouse and dbt         |                    Partial | Delta Lake concepts transfer, but Snowflake and dbt need direct exposure         |
+| Reliability and observability   |                     Strong | Pipeline, event, exception and validation logging                                |
+| Incident management             |                    Unclear | You will need specific production-support examples                               |
+| Stakeholder communication       |                     Strong | Your work crosses developers, architects, Methods, MI and data consumers         |
+| Technical leadership            |         Potentially strong | Must demonstrate mentoring, design influence and ownership beyond assigned tasks |
+
+
+
+You should apply. The role is within reach if your application positions you as a lead-level data-platform engineer with transferable cloud expertise, rather than as someone who only develops Databricks notebooks.
+
+2. What EVT is really looking for
+
+The position has four overlapping dimensions.
+
+A. Hands-on engineering
+
+EVT does not appear to want a lead who only coordinates people. It wants someone who can personally:
+
+develop Python pipelines
+diagnose unreliable workflows
+deploy infrastructure
+enhance CI/CD
+work across orchestration, warehousing and transformation
+respond to incidents
+
+This aligns well with your current hands-on Senior Analyst Developer role.
+
+B. Platform ownership
+
+The repeated references to reliability, infrastructure, GitOps and critical incidents indicate that EVT wants someone who treats the data platform as a product.
+
+They will probably assess whether you can answer questions such as:
+
+How do you make a pipeline idempotent?
+How do you recover from a partial failure?
+How do you handle late-arriving data?
+How do you deploy changes safely?
+What do you monitor?
+How do you diagnose incorrect data?
+How do you design for replay and backfill?
+How do you prevent one pipeline from affecting the wider platform?
+
+Your CPS project gives you good material for these discussions.
+
+C. Technical leadership
+
+“Lead” in this job means:
+
+establishing patterns
+improving engineering standards
+reviewing designs
+mentoring engineers
+influencing technical direction
+making decisions during incidents
+
+You need to show that you have shaped how the team works, not merely completed assigned user stories.
+
+D. Cross-functional delivery
+
+EVT operates across hotels, entertainment, restaurants, property and other ventures. Its data will likely originate from many operational systems and have inconsistent ownership and quality.
+
+Your Census project is highly relevant because it also combines:
+
+multiple source systems
+external reference data
+APIs
+administrative information
+survey responses
+complex business rules
+high data-quality expectations
+technical and non-technical stakeholders
+3. How your current Stats NZ project maps to the role
+Responsibility 1: Python pipelines and Dagster-style orchestration
+EVT requirement
+
+Build and maintain Python pipelines using an orchestrator such as Dagster.
+
+Your evidence
+
+Your current project includes:
+
+configuration-driven Python and Spark processing
+YAML-defined datasets and variables
+JSON parsing
+validation pipelines
+classification workflows
+incremental filtering
+Delta table writing
+reusable services
+Databricks job definitions
+parameterised notebook entry points
+
+Your recent work is especially valuable:
+
+keeping ESS1 and ESS2 incremental logic around sys_create_date
+separating distinct ESS3 incremental behaviour
+simplifying reusable functions
+introducing a notebook to accept a configuration path and execute the processing
+aligning YAML, source logic and table definitions
+creating PRs for controlled changes
+How to position it
+
+Do not say:
+
+I have not used Dagster, but I have used Databricks.
+
+Say:
+
+I design and maintain Python-based, configuration-driven data pipelines orchestrated through Databricks Jobs and Asset Bundles. The workflows use parameterised entry points, environment-specific configuration, incremental processing, reusable transformation modules, automated testing and operational logging. Although my current orchestrator is Databricks Jobs rather than Dagster, the underlying orchestration concerns, including dependencies, retries, configuration, observability, idempotency and backfills, are directly transferable.
+
+This acknowledges the gap without weakening your experience.
+
+Responsibility 2: AWS, EKS, CDK and Terraform
+EVT requirement
+
+Deploy and manage infrastructure on AWS using EKS, CDK and Terraform.
+
+Your evidence
+
+Your direct experience is more likely to include:
+
+Azure-hosted Databricks
+Databricks workspaces
+Delta Lake
+Unity Catalog or catalog/schema controls
+Databricks Asset Bundles
+environment-specific deployment targets
+cluster definitions
+service integrations
+Azure DevOps
+
+These are relevant platform skills, but they are not direct evidence of AWS infrastructure management.
+
+Honest assessment
+
+This is your largest gap.
+
+In particular:
+
+EKS implies Kubernetes operational knowledge.
+CDK implies infrastructure described programmatically, usually through TypeScript or Python.
+Terraform implies declarative infrastructure lifecycle management.
+AWS experience may include IAM, S3, networking, secrets, monitoring and deployment controls.
+How to bridge it
+
+Frame your experience around transferable platform concepts:
+
+| Stats NZ experience               | EVT equivalent                               |
+| --------------------------------- | -------------------------------------------- |
+| Azure Databricks workspaces       | AWS-hosted data platform services            |
+| ADLS                              | Amazon S3                                    |
+| Azure identity and permissions    | AWS IAM                                      |
+| Databricks Asset Bundles          | Infrastructure and deployment definitions    |
+| Databricks Jobs                   | Dagster deployment and execution             |
+| Cluster policies and job clusters | EKS workloads and platform policies          |
+| Azure DevOps pipelines            | GitOps CI/CD workflows                       |
+| Delta Lake tables                 | Snowflake-managed warehouse tables           |
+| Environment targets               | Account and environment-specific deployments |
+
+
+Do not claim EKS, CDK or Terraform experience unless you have actually used them.
+
+A good interview answer would be:
+
+My current platform is Azure Databricks rather than AWS, so I would not present myself as already being the deepest EKS specialist. What I bring is hands-on ownership of cloud data pipelines, environment-managed deployments, permissions, configuration, observability and production reliability. I understand the platform concerns that remain constant across clouds, and I am actively building direct AWS and Terraform experience to close the implementation-specific gap.
+
+Responsibility 3: CI/CD and GitOps
+EVT requirement
+
+Own CI/CD pipelines and apply GitOps practices.
+
+Your evidence
+
+Your project gives you multiple examples:
+
+Azure DevOps repository workflows
+pull requests and peer review
+Databricks Asset Bundle deployment
+version-controlled jobs
+version-controlled table definitions
+YAML-controlled transformations
+separate dev, tst1, uat1 and local targets
+automated unit, BDD, smoke and integration tests
+coordinated changes across code, configuration and schemas
+
+Your recent work also demonstrates good delivery discipline. You changed the YAML definitions, updated the corresponding table model, removed obsolete fields, simplified implementation files and prepared structured PR documentation.
+
+Leadership framing
+
+Instead of focusing only on committing code, describe the release model:
+
+I work in a Git-based delivery model where processing configuration, Python implementation, Databricks jobs and database definitions are reviewed and deployed together. I focus on keeping environment configuration separate, making transformations testable, and ensuring schema changes are traceable through pull requests.
+
+If you have contributed to build or deployment pipelines themselves, make that explicit. “Used CI/CD” is weaker than “designed, maintained or improved CI/CD.”
+
+Responsibility 4: Snowflake and dbt
+EVT requirement
+
+Work within Snowflake and support dbt transformations.
+
+Your evidence
+
+Your current project uses a comparable but different pattern:
+
+Databricks SQL and Spark
+Delta Lake
+layered data states
+configuration-driven transformations
+data contracts
+incremental writes
+SCD Type 2 patterns
+schema deployment
+testable transformations
+environment-specific data objects
+Transferable concepts
+
+The engineering ideas transfer well:
+
+incremental models
+materialisation strategies
+source and target definitions
+model dependencies
+data tests
+documentation
+lineage
+dimensional modelling
+slowly changing dimensions
+quality gates
+environment promotion
+How to discuss the gap
+
+My current implementation uses Databricks, Spark and Delta rather than Snowflake and dbt. However, I work with the same underlying warehouse-engineering concerns: incremental models, SCD history, source-to-target contracts, schema deployment, quality tests, lineage and environment promotion. I would expect the main learning curve to be Snowflake optimisation and dbt conventions, rather than the underlying data-engineering approach.
+
+A small dbt project would significantly improve your credibility because dbt is relatively quick to demonstrate compared with EKS.
+
+Responsibility 5: Data quality, testing and reliability
+
+This is probably your strongest match.
+
+Your project evidence
+
+The repository includes:
+
+Pydantic configuration validation
+data contracts
+required-field and type checks
+key and constraint validation
+parse-failure handling
+exception logging
+event logging
+pipeline-run logging
+audit columns
+business-key hashes
+row-content hashes
+unchanged-record filtering
+pytest
+pytest-bdd
+smoke tests
+integration tests
+an 85% configured coverage threshold
+
+The nature of Census data also strengthens your story. The consequences of incorrect classifications, missing records, inconsistent identifiers or unreproducible outputs are significant.
+
+Strong application wording
+
+Championed reliable, configuration-driven processing for Census survey data using schema contracts, automated validation, deterministic transformation rules, audit hashing, incremental processing, structured exception logging and unit/BDD testing.
+
+Use “championed” only if you influenced or introduced these practices. Otherwise use “contributed to” or “implemented.”
+
+Responsibility 6: Critical incidents and production issues
+Current evidence
+
+The repository contains the engineering foundations for production support:
+
+pipeline-run logs
+event logs
+exception logs
+validation failures
+record counts
+incremental watermarks
+processing audit fields
+rerunnable jobs
+
+However, the job asks for actual incident response experience, not only logging features.
+
+You need one or two genuine examples covering:
+
+what failed
+how it was detected
+the business impact
+how you diagnosed it
+how service was restored
+how recurrence was prevented
+how stakeholders were updated
+
+Possible examples from your work could include:
+
+unexpected source schema changes
+invalid YAML or configuration
+a table definition becoming inconsistent with transformation output
+an incremental watermark skipping or reprocessing records
+an API integration failure
+classification reference-data issues
+deployment failures between environments
+duplicate or stale data caused by merge behaviour
+
+Do not invent a severe incident. A lower-severity production data problem is still useful if you demonstrate disciplined ownership.
+
+Responsibility 7: Cross-functional communication
+Your evidence
+
+Your current project requires collaboration among:
+
+Census processing developers
+solution and data architects
+analysts
+Methods and Design
+data suppliers
+Manual Intervention teams
+platform teams
+administrative-data and linkage teams
+output consumers
+
+Your requirement discussions around the ur_address flow are a particularly good example. The implementation changed as the team clarified:
+
+where the data initially lands
+when it moves to Manual Intervention
+how it returns
+which classified table receives the result
+whether separate paradata or variable tables remain necessary
+
+This demonstrates that you can convert an evolving business process into:
+
+configuration
+schemas
+incremental logic
+deployment changes
+testable engineering tasks
+Interview framing
+
+I frequently work where the processing requirement is not fully expressed as a technical specification. I map the business lifecycle, establish the authoritative source and target states, clarify exception and reprocessing behaviour, and then convert that into schema, configuration, pipeline and testing changes.
+
+That is lead-level language because it focuses on resolving ambiguity.
+
+Responsibility 8: Coaching and mentoring
+
+This needs explicit evidence on your CV.
+
+Look for real examples where you have:
+
+reviewed another developer’s PR
+explained repository patterns
+helped someone write YAML configurations
+guided a developer through Databricks or Spark
+established coding conventions
+simplified a framework so it was easier for others to use
+supported onboarding
+facilitated a technical discussion
+documented a reusable approach
+paired with another developer to diagnose an issue
+
+Your role does not need to include formal line management. Lead engineering frequently involves technical mentoring without direct reports.
+
+A suitable CV statement could be:
+
+Supported developers through design discussions, code reviews and reusable pipeline patterns, helping the team apply consistent approaches to configuration, incremental processing, schema changes and testing.
+
+Use stronger wording only if you can support it with concrete examples.
+
+4. Best evidence from your CPS project
+
+These are likely your strongest selling points.
+
+Configuration-driven platform engineering
+
+The project does not contain only one-off notebooks. It provides reusable engines controlled through YAML and typed configuration models.
+
+This demonstrates:
+
+abstraction
+reuse
+platform thinking
+developer enablement
+standardisation
+reduction in duplicated logic
+Incremental processing
+
+Your work on separate incremental strategies is directly relevant.
+
+You can discuss:
+
+watermark columns
+stage-specific filtering
+late-arriving records
+idempotency
+unchanged-record detection
+merge behaviour
+SCD Type 2
+reprocessing
+auditability
+Engineering quality
+
+The combination of:
+
+pytest
+BDD scenarios
+data-contract validation
+configuration validation
+smoke testing
+integration testing
+coverage settings
+
+gives you a strong response to EVT’s quality and reliability requirements.
+
+Operational visibility
+
+Pipeline, event and exception logging demonstrate that you understand the difference between code that runs and a platform that can be operated.
+
+Complex integrations
+
+Your project works with:
+
+Salesforce survey data
+ARIA
+Intech geocoding
+Operational Frame information
+administrative-linking processes
+Databricks
+Delta tables
+Azure DevOps
+
+This is relevant to EVT, which likely has many operational systems across its business portfolio.
+
+Handling sensitive, high-value data
+
+Census data requires:
+
+controlled access
+lineage
+reproducibility
+quality
+careful identifier handling
+defensible transformation rules
+
+That responsibility can distinguish you from candidates whose experience is limited to lower-risk analytics pipelines.
+
+5. Gaps you should address before applying
+Priority 1: Terraform
+
+Build a small repository that provisions:
+
+S3 storage
+IAM roles
+networking or security groups
+a simple compute component
+environment-specific variables
+remote state
+formatting and validation in CI
+
+The goal is not certification-level breadth. It is being able to explain:
+
+state
+planning
+applying
+drift
+modules
+environment separation
+secrets
+rollback considerations
+Priority 2: dbt and Snowflake
+
+Create a modest dbt project with:
+
+source definitions
+staging models
+intermediate models
+marts
+incremental materialisation
+tests
+snapshots
+documentation
+model contracts
+CI validation
+
+If Snowflake access is unavailable, use dbt with another compatible local platform for learning, but be transparent about it.
+
+Priority 3: Dagster
+
+Rebuild a small version of your Census-style flow:
+
+raw response
+    → parsing
+    → validation
+    → classification
+    → final table
+
+
+Demonstrate:
+
+assets
+dependencies
+partitions
+resources
+retries
+schedules
+sensors
+metadata
+tests
+backfills
+
+Your existing pipeline understanding should transfer quickly.
+
+Priority 4: AWS and EKS vocabulary
+
+You need enough understanding to hold a design conversation covering:
+
+IAM
+S3
+ECR
+EKS
+pods
+deployments
+services
+namespaces
+secrets
+observability
+autoscaling
+workload identity
+networking
+deployment rollback
+
+Be careful not to portray tutorial exposure as production experience.
+
+Priority 5: Leadership examples
+
+Prepare at least four STAR examples:
+
+a technical design you influenced
+an unreliable process you improved
+an ambiguous requirement you clarified
+a teammate you helped or mentored
+
+Also prepare one incident example.
+
+6. CV positioning
+Suggested professional summary
+
+Senior data engineering and software professional with 5+ years of experience designing and delivering cloud-based data pipelines and reusable processing frameworks. Currently contributing to Stats NZ’s Census Processing System, building configuration-driven Python and Spark pipelines on Databricks for parsing, validation, classification and incremental Delta processing. Experienced in CI/CD, automated testing, data-quality controls, operational logging, schema deployment and cross-functional delivery in a high-trust data environment. Strong focus on platform reliability, maintainable engineering patterns and supporting other engineers through design collaboration and code review.
+
+Adjust “5+ years” to your exact experience.
+
+Suggested current-role bullets
+
+Choose only bullets that are factually accurate.
+
+Design and implement configuration-driven Python and Spark pipelines for Stats NZ’s Census Processing System, processing individual, household and dwelling survey records across parsing, validation and classification stages.
+Developed reusable incremental-processing patterns using watermarks, audit metadata and Delta merge strategies, with separate processing behaviour for pipeline stages with different change-detection requirements.
+Created and maintained YAML-based dataset and variable configurations, aligning processing rules with target schemas and Databricks deployment definitions.
+Contributed to reusable frameworks for JSON parsing, data-contract validation, classification, logging and versioned Delta-table persistence.
+Built parameterised Databricks notebook entry points and job configurations, keeping orchestration separate from reusable business logic.
+Implemented and maintained automated tests using pytest and BDD scenarios for transformation rules, configuration behaviour and data-quality requirements.
+Supported CI/CD through Azure DevOps pull requests, peer review, Databricks Asset Bundles and environment-specific deployments across development and test environments.
+Collaborated with architects, analysts, methodology specialists and development teams to translate evolving Census processing rules into maintainable data models and engineering workflows.
+Improved operational support through structured pipeline, event, exception and validation logging, enabling traceability of processing outcomes and failures.
+Contributed to technical design discussions and code reviews, promoting simpler reusable components and consistent engineering patterns across the team.
+Skills ordering for this application
+
+Put the most relevant skills first:
+
+Python, PySpark, Databricks, Delta Lake, SQL, data pipelines,
+incremental processing, data quality, pytest, CI/CD, Azure DevOps,
+Databricks Asset Bundles, YAML, Pydantic, Git, API integration,
+data modelling, production support, technical mentoring
+
+Then add AWS, Terraform, Dagster, Snowflake or dbt only at the proficiency level you can defend:
+Working knowledge: AWS, Terraform, Dagster, Snowflake, dbt
+
+
+
+Do not mix working knowledge with production experience under one undifferentiated skills heading.
+
+7. Your strongest application narrative
+
+Your story should be:
+
+At Stats NZ, I am helping build a modern, configuration-driven data-processing platform for an annual admin-first Census model. My work involves Python and Spark pipeline development, Databricks orchestration, incremental processing, schema and configuration alignment, automated validation, Delta persistence, operational logging and controlled deployment through Git and Azure DevOps. The environment has demanding requirements for data quality, traceability and reproducibility. I also work across technical and business teams to turn evolving processing requirements into reusable engineering solutions.
+
+EVT uses a different cloud stack, but the core engineering problems are highly familiar: integrating multiple operational systems, building reliable pipelines, managing incremental changes, establishing data-quality controls, deploying through CI/CD and operating a trusted platform. I can bring those engineering and leadership practices immediately while applying them to AWS, Dagster, Snowflake and dbt.
+
+8. Likely interview questions
+“You have Databricks experience. How will you adapt to Snowflake and dbt?”
+
+Focus on concepts:
+
+incremental materialisation
+SCD patterns
+data contracts
+tests
+source-to-target lineage
+warehouse modelling
+environment promotion
+performance optimisation
+
+Then acknowledge Snowflake-specific areas you are learning.
+
+“You have not used Dagster in production. Why should we consider you?”
+
+Explain your experience with:
+
+Databricks Jobs
+dependency management
+parameterised notebooks
+job configuration
+retries
+logging
+schedule and event-based execution
+backfills
+idempotency
+
+Then show a Dagster project or describe your practical learning.
+
+“What makes you a lead rather than a senior engineer?”
+
+Give evidence that you:
+
+influence design
+establish patterns
+simplify systems for others
+clarify ambiguous requirements
+review code
+mentor developers
+take ownership of outcomes
+consider operations, not just implementation
+“Tell us about a production incident.”
+
+Use a real example and cover:
+
+Detection
+Impact
+Containment
+Diagnosis
+Recovery
+Communication
+Root cause
+Preventive action
+
+
+“How do you ensure data quality?”
+
+Use your Census project to discuss multiple layers:
+
+Configuration validation
+    ↓
+Input schema validation
+    ↓
+Parsing checks
+    ↓
+Business-rule validation
+    ↓
+Target-table constraints
+    ↓
+Reconciliation and record counts
+    ↓
+Automated tests
+    ↓
+Operational alerts
+
+
+9. Final recommendation
+
+You are a credible candidate, particularly if EVT is open to a strong lead data engineer transferring between cloud stacks. Your Census project gives you stronger evidence than a typical ETL role because it demonstrates reusable platform components, complex data rules, auditability, quality controls, deployment discipline and cross-functional delivery.
+
+Your application should not try to hide the technology gaps. Address them directly:
+
+Strong production experience: Python, Spark, Databricks, Delta, pipelines, testing, configuration, logging and CI/CD.
+Transferable architectural experience: orchestration, cloud data platforms, incremental models, reliability and Git-based delivery.
+Actively developing: AWS, EKS, Terraform/CDK, Dagster, Snowflake and dbt.
+Lead-level value: technical direction, ownership, mentoring, design clarity and calm production problem-solving.
+
+The decisive factor will be whether you present yourself as someone who completed framework tasks or as an engineer who helped establish reliable platform patterns. Your project supports the second narrative, but your CV and interview examples need to make that ownership explicit.
