@@ -1,0 +1,48 @@
+pipeline:
+  name: "ess_bronze_to_silver_pipeline"
+  source_state: "ess1"
+  target_state: "ess2"
+
+  # Transformation & Parsing Metadata
+  transformations:
+    # Step 1: Parse the JSON string payload into its constituent fields
+    - type: "json_parse"
+      source_column: "json_data"
+      json_schema:
+        - name: "first_name"
+          type: "string"
+        - name: "last_name"
+          type: "string"
+        - name: "address"
+          type: "string"
+        - name: "DOB"
+          type: "date"
+          format: "yyyy-MM-dd"
+
+    # Step 2: Explicitly define the final output table contract.
+    # This maps where columns come from (source table vs. parsed JSON structure).
+    - type: "select_and_map_columns"
+      mapping:
+        # Target Column Name  :  Source DataFrame Reference
+        - target_name: "id"
+          source_expression: "id" # Standard pass-through
+        - target_name: "user_name"
+          source_expression: "user_name" # Standard pass-through
+        - target_name: "mode"
+          source_expression: "mode" # Standard pass-through
+        - target_name: "date"
+          source_expression: "date" # Standard pass-through
+        - target_name: "first_name"
+          source_expression: "parsed_json.first_name" # Pulled from parsed struct
+        - target_name: "last_name"
+          source_expression: "parsed_json.last_name" # Pulled from parsed struct
+        - target_name: "address"
+          source_expression: "parsed_json.address" # Pulled from parsed struct
+        - target_name: "DOB"
+          source_expression: "parsed_json.DOB" # Pulled from parsed struct
+
+  # Target configuration stays lightweight
+  target:
+    dataset_name: "survey_parsed_data"
+    format: "delta"
+    save_mode: "append"
