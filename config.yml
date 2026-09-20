@@ -1,0 +1,38 @@
+name: collection_config
+
+valid_environments:
+  - dev
+  - prod
+
+# Maps environment names to actual Databricks Unity Catalog names
+catalog_profiles:
+  processing:
+    dev: "main_dev"
+    prod: "main_prod"
+
+# Root paths for Unity Catalog external locations or cloud storage managed paths
+storage_profiles:
+  dev:
+    checkpoint_root: "abfss://checkpoints@devstorage.dfs.core.windows.net/"
+  prod:
+    checkpoint_root: "abfss://checkpoints@prodstorage.dfs.core.windows.net/"
+
+steady_states:
+  - name: ess1
+    layer: "bronze" # Explicitly maps the stage to its Medallion layer
+    catalog_profiles: processing
+    schema: survey_ess1
+    datasets:
+      - name: survey_raw_data
+        table_properties:
+          delta.autoOptimize.optimizeWrite: "true"
+          delta.autoOptimize.autoCompact: "true"
+
+  - name: ess2
+    layer: "silver"
+    catalog_profiles: processing
+    schema: survey_ess2
+    datasets:
+      - name: survey_parsed_data
+        table_properties:
+          delta.enableChangeDataFeed: "true" # Useful for downstream Gold processing
