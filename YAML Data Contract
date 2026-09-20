@@ -1,0 +1,69 @@
+data_contract_version: "1.2.0"
+data_product: "customer_orders_transform"
+owner: "data-engineering-team"
+
+# Define the source input tables
+sources:
+  - name: raw_ecommerce
+    database: postgres_prod
+    schema: public
+    tables:
+      - table_name: orders
+        columns:
+          - name: order_id
+            type: string
+            constraints: [not_null, unique]
+          - name: customer_id
+            type: string
+            constraints: [not_null]
+          - name: order_date
+            type: timestamp
+          - name: order_total
+            type: float
+
+      - table_name: customers
+        columns:
+          - name: customer_id
+            type: string
+            constraints: [not_null, unique]
+          - name: region
+            type: string
+
+# Define transformation operations and logic
+transformations:
+  - step_name: aggregate_regional_sales
+    type: join_and_group
+    description: "Join orders with customer regions and aggregate daily totals"
+    input_tables:
+      - raw_ecommerce.orders
+      - raw_ecommerce.customers
+    join_condition: "orders.customer_id = customers.customer_id"
+    group_by:
+      - customers.region
+      - orders.order_date
+    aggregations:
+      - expression: "SUM(orders.order_total)"
+        alias: total_revenue
+      - expression: "COUNT(orders.order_id)"
+        alias: total_orders
+
+# Define the destination target tables
+targets:
+  - name: analytics_warehouse
+    database: snowflake_dw
+    schema: gold_layer
+    table_name: fact_regional_sales
+    write_mode: append # Options: append, overwrite, merge
+    columns:
+      - name: sales_region
+        source_column: region
+        type: string
+      - name: transaction_date
+        source_column: order_date
+        type: date
+      - name: daily_revenue
+        source_column: total_revenue
+        type: float
+      - name: order_count
+        source_column: total_orders
+        type: integer
